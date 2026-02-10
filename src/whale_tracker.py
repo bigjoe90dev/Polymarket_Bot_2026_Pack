@@ -743,6 +743,36 @@ class WhaleTracker:
         print(f"[BLOCKCHAIN] Signal added: {signal['source_username']} → "
               f"{signal['market_title'][:50]} ({signal['outcome']}) @ ${signal['whale_price']:.3f}")
 
+    def add_discovered_wallet(self, discovery_signal):
+        """Add a newly discovered wallet from network discovery.
+
+        Network Discovery: Automatically finds profitable wallets by monitoring
+        high-value trades ($500+) from unknown addresses on-chain.
+
+        Args:
+            discovery_signal: Dict with discovery details
+                {address, trade_value, token_id, amount, tx_hash, block_number, timestamp}
+        """
+        address = discovery_signal["address"].lower()
+
+        # Skip if already tracking
+        if address in self.tracked_wallets or address in self.network_wallets:
+            return
+
+        # Add to network_wallets for monitoring (not copied yet, needs performance validation)
+        self.network_wallets[address] = {
+            "discovered_at": time.time(),
+            "discovery_trade_value": discovery_signal["trade_value"],
+            "discovery_tx": discovery_signal["tx_hash"],
+            "total_volume": discovery_signal["trade_value"],
+            "trades_seen": 1,
+        }
+
+        self._save_state()
+
+        print(f"[WHALE] 🔍 NETWORK DISCOVERY: Added {address[:10]}... "
+              f"(${discovery_signal['trade_value']:.0f} trade)")
+
     def get_stats(self):
         total = len(self.tracked_wallets) + len(self.network_wallets)
         return {

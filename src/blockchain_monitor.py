@@ -77,6 +77,7 @@ class BlockchainMonitor:
         self.events_received = 0
         self.signals_emitted = 0
         self.whale_trades_detected = 0
+        self.wallets_discovered = 0  # Network discovery counter
         self.last_event_time = 0
         self.last_block = 0
 
@@ -189,7 +190,20 @@ class BlockchainMonitor:
             maker = Web3.to_checksum_address(args['maker'])
             taker = Web3.to_checksum_address(args['taker'])
 
-            # Check if maker or taker is a tracked whale
+            # Extract trade amounts for network discovery
+            maker_amount = args['makerAmountFilled']
+            taker_amount = args['takerAmountFilled']
+
+            # Network Discovery: Detect high-value trades from ANY wallet
+            # If trade > $500, this might be a new whale to track
+            trade_value_usdc = max(maker_amount, taker_amount) / 1e6  # Convert from wei
+            if trade_value_usdc >= 500:
+                # Emit discovery signal for both maker and taker (one might be the whale)
+                for address, side in [(maker, "maker"), (taker, "taker")]:
+                    if address not in self.tracked_wallets:
+                        self._emit_network_discovery(address, side, event, trade_value_usdc)
+
+            # Check if maker or taker is a tracked whale (for copy trading)
             whale_address = None
             whale_side = None
             if maker in self.tracked_wallets:
@@ -200,15 +214,13 @@ class BlockchainMonitor:
                 whale_side = "taker"
 
             if not whale_address:
-                return  # Not a whale trade
+                return  # Not a tracked whale (but may have been discovered above)
 
             self.whale_trades_detected += 1
 
-            # Extract trade details
+            # Extract trade details (maker_amount and taker_amount already extracted above)
             maker_asset_id = args['makerAssetId']
             taker_asset_id = args['takerAssetId']
-            maker_amount = args['makerAmountFilled']
-            taker_amount = args['takerAmountFilled']
             fee = args['fee']
 
             # Whale's token ID (the one they're buying)
@@ -239,6 +251,21 @@ class BlockchainMonitor:
                 print(f"[BLOCKCHAIN] Failed to fetch market data for token {whale_token_id}")
                 return
 
+            # Gas Signals: Extract gas price from transaction (indicates conviction)
+            # High gas = high conviction (whale paying premium for fast execution)
+            gas_price_wei = 0
+            try:
+                tx_receipt = self.web3.eth.get_transaction(event['transactionHash'])
+                gas_price_wei = tx_receipt.get('gasPrice', 0)
+                gas_price_gwei = gas_price_wei / 1e9 if gas_price_wei else 0
+
+                # Log high-conviction trades
+                if gas_price_gwei > 200:
+                    print(f"[BLOCKCHAIN] 🔥 HIGH CONVICTION: {whale_address[:10]}... "
+                          f"paid {gas_price_gwei:.0f} gwei gas")
+            except Exception as e:
+                gas_price_gwei = 0  # Default if gas price fetch fails
+
             # Emit signal to whale_tracker
             signal_data = {
                 "source_wallet": whale_address,
@@ -251,6 +278,7 @@ class BlockchainMonitor:
                 "size": int(whale_amount),
                 "tx_hash": event['transactionHash'].hex(),
                 "block_number": event['blockNumber'],
+                "gas_price_gwei": gas_price_gwei,  # Gas Signals
             }
 
             self.on_whale_trade(whale_address, signal_data)
@@ -258,6 +286,47 @@ class BlockchainMonitor:
 
         except Exception as e:
             print(f"[BLOCKCHAIN] Failed to process OrderFilled event: {e}")
+
+    def _emit_network_discovery(self, address, side, event, trade_value):
+        """Emit a network discovery signal for a high-value trade from an unknown wallet.
+
+        This allows the bot to automatically discover profitable whales before they
+        appear on the leaderboard.
+        """
+        try:
+            args = event['args']
+            # Determine which token this wallet is buying
+            token_id = args['takerAssetId'] if side == "maker" else args['makerAssetId']
+            amount = args['takerAmountFilled'] if side == "maker" else args['makerAmountFilled']
+
+            # Log discovery
+            print(f"[BLOCKCHAIN] 🔍 DISCOVERED: {address[:10]}... "
+                  f"traded ${trade_value:.0f} (token {token_id})")
+
+            self.wallets_discovered += 1
+
+            # Emit discovery signal to whale_tracker
+            # The whale_tracker will decide whether to add this wallet to network_wallets
+            discovery_signal = {
+                "type": "network_discovery",
+                "address": address,
+                "trade_value": trade_value,
+                "token_id": token_id,
+                "amount": int(amount),
+                "tx_hash": event['transactionHash'].hex(),
+                "block_number": event['blockNumber'],
+                "timestamp": time.time(),
+            }
+
+            # Call the callback with discovery signal
+            # (whale_tracker will handle adding to network if criteria met)
+            if hasattr(self.on_whale_trade, '__self__'):  # Check if it's a bound method
+                whale_tracker = self.on_whale_trade.__self__
+                if hasattr(whale_tracker, 'add_discovered_wallet'):
+                    whale_tracker.add_discovered_wallet(discovery_signal)
+
+        except Exception as e:
+            print(f"[BLOCKCHAIN] Failed to emit network discovery: {e}")
 
     def _fetch_market_from_token_id(self, token_id):
         """Fetch market metadata from Polymarket API using ERC1155 token ID.

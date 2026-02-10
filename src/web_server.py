@@ -260,6 +260,7 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
             "connected": monitor.web3.is_connected() if hasattr(monitor, 'web3') else False,
             "running": monitor.running,
             "wallets_tracked": len(monitor.tracked_wallets),
+            "wallets_discovered": monitor.wallets_discovered,  # Network Discovery
             "events_processed": monitor.events_received,
             "signals_emitted": monitor.signals_emitted,
             "last_event_time": monitor.last_event_time,
@@ -294,6 +295,7 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
                 "size": sig.get("size", 0),
                 "source": sig.get("source", "api"),
                 "staleness": round(time.time() - sig.get("timestamp", time.time()), 1),
+                "gas_price_gwei": sig.get("gas_price_gwei", 0),  # Gas Signals
             })
 
         self._send_json({"trades": trades, "count": len(trades)})

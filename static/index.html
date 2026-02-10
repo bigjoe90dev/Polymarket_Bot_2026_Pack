@@ -793,7 +793,8 @@ function updateBlockchain(d) {
 
   const status = d.connected ? '🟢 LIVE' : '🔴 DOWN';
   const block = d.current_block ? ' #' + (d.current_block + '').slice(-4) : '';
-  $('pill-blockchain').textContent = 'BC: ' + status + block;
+  const discovered = d.wallets_discovered > 0 ? ` (🔍${d.wallets_discovered})` : '';
+  $('pill-blockchain').textContent = 'BC: ' + status + block + discovered;
   $('pill-blockchain').style.borderColor = d.connected ? '#8A2BE2' : '#FF4444';
   $('pill-blockchain').style.color = d.connected ? '#DDA0DD' : '#FF6B6B';
 
@@ -821,10 +822,15 @@ function updateLiveTrades(d) {
     const sourceIcon = t.source === 'blockchain' ? '⚡' : '📡';
     const sourceColor = t.source === 'blockchain' ? '#DDA0DD' : '#DAA520';
 
+    // Gas Signals: Show conviction indicators
+    let gasIcon = '';
+    if (t.gas_price_gwei > 200) gasIcon = ' 🔥'; // High conviction
+    else if (t.gas_price_gwei > 0 && t.gas_price_gwei < 50) gasIcon = ' ❄️'; // Low conviction
+
     return `
       <div style="padding:8px 12px;border-left:3px solid ${sideColor};background:rgba(10,5,20,0.5);margin-bottom:8px;border-radius:4px">
         <div style="display:flex;justify-content:space-between;align-items:center">
-          <span style="color:${sideColor};font-weight:bold">${t.side}</span>
+          <span style="color:${sideColor};font-weight:bold">${t.side}${gasIcon}</span>
           <span style="color:rgba(255,248,220,0.6);font-size:0.85em">${timeAgo}</span>
         </div>
         <div style="margin-top:4px;color:#FFF8DC;font-size:0.9em">${t.market}</div>

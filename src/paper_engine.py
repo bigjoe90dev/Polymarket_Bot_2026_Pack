@@ -443,6 +443,19 @@ class PaperTradingEngine:
             gas_fee = stress_result["gas_fee"]
             stress_tags = stress_result["stress_tags"]
 
+            # ── Gas Signals: Adjust size based on whale's conviction ──
+            # High gas = whale paying premium for fast execution = high conviction
+            gas_price_gwei = signal.get("gas_price_gwei", 0)
+            gas_multiplier = 1.0
+            if gas_price_gwei > 200:  # High conviction
+                gas_multiplier = 1.5
+                stress_tags.append("HIGH_GAS_CONVICTION")
+            elif gas_price_gwei > 0 and gas_price_gwei < 50:  # Low conviction
+                gas_multiplier = 0.75
+                stress_tags.append("LOW_GAS_CONVICTION")
+
+            copy_budget *= gas_multiplier
+
             # ── Winner's Curse Protection ──
             # If our entry is too much worse than the whale's, skip
             max_dev = self.config.get("WINNER_CURSE_MAX_PCT", MAX_PRICE_DEVIATION)
