@@ -1,0 +1,20 @@
+# env files (secrets)
+.env
+.env.*
+!.env.example
+
+# macOS junk
+.DS_Store
+
+# python virtual env
+venv/
+.venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# data/log outputs (optional but usually smart)
+data/
+*.log
+audit_log.txt
