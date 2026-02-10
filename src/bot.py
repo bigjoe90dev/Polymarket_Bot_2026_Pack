@@ -10,6 +10,7 @@ from src.data_collector import DataCollector
 from src.whale_tracker import WhaleTracker
 from src.wallet_scorer import WalletScorer
 from src.notifier import TelegramNotifier
+from src.blockchain_monitor import BlockchainMonitor
 
 # Free-infra speed constants (overridable via config)
 DEFAULT_MARKETS_PER_CYCLE = 20   # Order books fetched per cycle
@@ -47,6 +48,16 @@ class TradingBot:
         # Whale tracking for copy trading (with scorer for market filtering)
         self.whale_tracker = WhaleTracker(config, wallet_scorer=self.wallet_scorer)
 
+        # Blockchain monitor for real-time whale trades (2-3s latency vs 5-12min polling)
+        self.blockchain_monitor = None
+        if config.get("USE_BLOCKCHAIN_MONITOR", False):
+            def on_whale_trade(whale_address, signal_data):
+                """Callback when blockchain monitor detects whale trade."""
+                self.whale_tracker.add_blockchain_signal(whale_address, signal_data)
+
+            self.blockchain_monitor = BlockchainMonitor(config, on_whale_trade)
+            print("[*] Blockchain monitor initialized (will start after whale discovery)")
+
         # Telegram notifications
         self.notifier = TelegramNotifier(config)
 
@@ -73,6 +84,13 @@ class TradingBot:
         # Discover profitable traders from leaderboard ($3k-$10k/month)
         print("[*] Discovering profitable traders from leaderboard...")
         self.whale_tracker.discover_whales()
+
+        # Start blockchain monitor if enabled (after whale discovery so we have wallets to track)
+        if self.blockchain_monitor:
+            tracked_addresses = list(self.whale_tracker.tracked_wallets.keys())
+            self.blockchain_monitor.update_tracked_wallets(tracked_addresses)
+            self.blockchain_monitor.start()
+            print(f"[BLOCKCHAIN] Real-time monitoring started for {len(tracked_addresses)} whales")
 
         # Startup notification
         self.notifier.notify_startup(
@@ -143,34 +161,37 @@ class TradingBot:
                         print(f"[!] Copy trade error: {e}")
 
             # ── Arb scanning: rotate through markets ──────────
-            batch = self._get_next_batch(markets)
+            # DISABLED by default: negative EV per 4 LLM reviews
+            # (HFT competition + two-leg execution risk = losses)
+            if self.config.get("ENABLE_ARB_SCANNER", False):
+                batch = self._get_next_batch(markets)
 
-            for m in batch:
-                try:
-                    book = self.market.get_order_book(m)
-                    if not book:
+                for m in batch:
+                    try:
+                        book = self.market.get_order_book(m)
+                        if not book:
+                            self._fetch_errors += 1
+                            continue
+
+                        plan = check_opportunity(book, self.config)
+                        self.collector.record(m, book, plan)
+                        self._update_heat(m, book)
+
+                        if plan:
+                            log_decision(
+                                "OPPORTUNITY",
+                                f"[{plan['type']}] profit=${plan['expected_profit']:.4f}/unit "
+                                f"in {m['condition_id'][:12]}..."
+                            )
+                            result = self.execution.execute_plan(
+                                plan, book=book, market_info=m
+                            )
+                            if result and result.get("success"):
+                                self.risk.add_exposure(result.get("total_cost", 0))
+
+                    except Exception:
                         self._fetch_errors += 1
                         continue
-
-                    plan = check_opportunity(book, self.config)
-                    self.collector.record(m, book, plan)
-                    self._update_heat(m, book)
-
-                    if plan:
-                        log_decision(
-                            "OPPORTUNITY",
-                            f"[{plan['type']}] profit=${plan['expected_profit']:.4f}/unit "
-                            f"in {m['condition_id'][:12]}..."
-                        )
-                        result = self.execution.execute_plan(
-                            plan, book=book, market_info=m
-                        )
-                        if result and result.get("success"):
-                            self.risk.add_exposure(result.get("total_cost", 0))
-
-                except Exception:
-                    self._fetch_errors += 1
-                    continue
 
             # Paper trading: settlement check and PnL snapshot (crash-proofed)
             try:
@@ -244,6 +265,10 @@ class TradingBot:
         print("[!] Shutting down...")
         self.running = False
         self.collector.flush()
+        # Stop blockchain monitor
+        if self.blockchain_monitor:
+            self.blockchain_monitor.stop()
+            print("[*] Blockchain monitor stopped.")
         # Flush all state files to prevent data loss
         try:
             if self.execution.paper_engine:

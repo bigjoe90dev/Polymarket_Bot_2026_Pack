@@ -245,6 +245,7 @@ body {
     <span class="pill pill-running" id="pill-status">Connecting...</span>
     <span class="pill pill-paper" id="pill-mode">---</span>
     <span class="pill pill-uptime" id="pill-uptime">---</span>
+    <span class="pill pill-blockchain" id="pill-blockchain" style="background:rgba(138,43,226,0.3);border-color:#8A2BE2;color:#DDA0DD">BC: ---</span>
   </div>
 </div>
 
@@ -276,6 +277,17 @@ body {
     <div class="card-label">All Time P&L</div>
     <div class="card-value" id="pnl-alltime" style="font-size:1.8em">$0.00</div>
     <div class="card-detail" id="pnl-alltime-trades">0 trades</div>
+  </div>
+</div>
+
+<!-- LIVE TRADE FEED -->
+<div class="card" style="margin-top:20px">
+  <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+    <span>⚡ Live Whale Trades</span>
+    <span id="trade-count" style="font-size:0.75em;color:#DAA520">0 detected</span>
+  </div>
+  <div id="live-trades" style="margin-top:15px;max-height:400px;overflow-y:auto;font-size:0.85em;line-height:1.8">
+    <div style="color:rgba(255,248,220,0.5);text-align:center;padding:20px">Waiting for whale trades...</div>
   </div>
 </div>
 
@@ -771,6 +783,62 @@ function updatePeriodPnL(d) {
   setPeriod('pnl-alltime', allPnl, allCount);
 }
 
+function updateBlockchain(d) {
+  if (!d || !d.enabled) {
+    $('pill-blockchain').textContent = 'BC: OFF';
+    $('pill-blockchain').style.borderColor = '#666';
+    $('pill-blockchain').style.color = '#999';
+    return;
+  }
+
+  const status = d.connected ? '🟢 LIVE' : '🔴 DOWN';
+  const block = d.current_block ? ' #' + (d.current_block + '').slice(-4) : '';
+  $('pill-blockchain').textContent = 'BC: ' + status + block;
+  $('pill-blockchain').style.borderColor = d.connected ? '#8A2BE2' : '#FF4444';
+  $('pill-blockchain').style.color = d.connected ? '#DDA0DD' : '#FF6B6B';
+
+  if (d.connected && d.signals_emitted > 0) {
+    $('pill-blockchain').style.animation = 'pulse 2s ease-in-out infinite';
+  }
+}
+
+function updateLiveTrades(d) {
+  if (!d || !d.trades || d.trades.length === 0) {
+    $('live-trades').innerHTML = '<div style="color:rgba(255,248,220,0.5);text-align:center;padding:20px">Waiting for whale trades...</div>';
+    $('trade-count').textContent = '0 detected';
+    return;
+  }
+
+  $('trade-count').textContent = d.count + ' detected';
+
+  const html = d.trades.map(t => {
+    const elapsed = Math.floor((Date.now() / 1000) - t.time);
+    const timeAgo = elapsed < 60 ? elapsed + 's ago' :
+                    elapsed < 3600 ? Math.floor(elapsed / 60) + 'm ago' :
+                    Math.floor(elapsed / 3600) + 'h ago';
+
+    const sideColor = t.side === 'YES' ? '#90EE90' : '#FF69B4';
+    const sourceIcon = t.source === 'blockchain' ? '⚡' : '📡';
+    const sourceColor = t.source === 'blockchain' ? '#DDA0DD' : '#DAA520';
+
+    return `
+      <div style="padding:8px 12px;border-left:3px solid ${sideColor};background:rgba(10,5,20,0.5);margin-bottom:8px;border-radius:4px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:${sideColor};font-weight:bold">${t.side}</span>
+          <span style="color:rgba(255,248,220,0.6);font-size:0.85em">${timeAgo}</span>
+        </div>
+        <div style="margin-top:4px;color:#FFF8DC;font-size:0.9em">${t.market}</div>
+        <div style="margin-top:4px;display:flex;justify-content:space-between;font-size:0.85em">
+          <span style="color:${sourceColor}">${sourceIcon} ${t.wallet}</span>
+          <span style="color:#DAA520">$${t.price.toFixed(2)} × ${t.size.toFixed(0)}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  $('live-trades').innerHTML = html;
+}
+
 
 /* ── CHART DRAWING ────────────────────────────────────────── */
 
@@ -884,7 +952,7 @@ let pollCount = 0;
 async function poll() {
   pollCount++;
 
-  const [status, portfolio, positions, trades, whales, risk, chartData, metrics] =
+  const [status, portfolio, positions, trades, whales, risk, chartData, metrics, blockchain, liveTrades] =
     await Promise.all([
       fetchJSON('/api/status'),
       fetchJSON('/api/portfolio'),
@@ -894,6 +962,8 @@ async function poll() {
       fetchJSON('/api/risk'),
       fetchJSON('/api/charts/pnl'),
       fetchJSON('/api/metrics'),
+      fetchJSON('/api/blockchain'),
+      fetchJSON('/api/live_trades'),
     ]);
 
   updateStatus(status);
@@ -904,6 +974,8 @@ async function poll() {
   updateWhales(whales);
   updateRisk(risk);
   updateMetrics(metrics);
+  updateBlockchain(blockchain);
+  updateLiveTrades(liveTrades);
 
   if (chartData) drawChart(chartData.data);
 }

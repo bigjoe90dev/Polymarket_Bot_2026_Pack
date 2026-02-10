@@ -701,6 +701,48 @@ class WhaleTracker:
     def get_recent_signals(self, limit=20):
         return list(reversed(self.recent_signals[-limit:]))
 
+    def add_blockchain_signal(self, whale_address, signal_data):
+        """Add a whale trade signal detected via blockchain monitoring.
+
+        Called by blockchain_monitor when a tracked whale trades on-chain.
+        Signal is added to recent_signals queue for copy trading execution.
+
+        Args:
+            whale_address: Checksummed Ethereum address of whale
+            signal_data: Dict with trade details from blockchain event
+                {condition_id, market_title, outcome, whale_price, timestamp, size, ...}
+        """
+        # Normalize address to match our tracked wallets format (lowercase)
+        wallet = whale_address.lower()
+
+        # Only process if we're tracking this wallet
+        if wallet not in self.tracked_wallets and wallet not in self.network_wallets:
+            return
+
+        # Add to recent signals for copy trading execution
+        signal = {
+            "source_wallet": wallet,
+            "source_username": self.tracked_wallets.get(wallet, {}).get("username", "Blockchain Whale"),
+            "condition_id": signal_data.get("condition_id", ""),
+            "market_title": signal_data.get("market_title", "Unknown"),
+            "outcome": signal_data.get("outcome", "YES"),
+            "whale_price": signal_data.get("whale_price", 0),
+            "timestamp": signal_data.get("timestamp", time.time()),
+            "detected_at": time.time(),
+            "size": signal_data.get("size", 0),
+            "tx_hash": signal_data.get("tx_hash", ""),
+            "source": "blockchain",  # Mark as blockchain-sourced
+        }
+
+        self.recent_signals.append(signal)
+
+        # Limit recent signals queue to 100 (memory management)
+        if len(self.recent_signals) > 100:
+            self.recent_signals = self.recent_signals[-100:]
+
+        print(f"[BLOCKCHAIN] Signal added: {signal['source_username']} → "
+              f"{signal['market_title'][:50]} ({signal['outcome']}) @ ${signal['whale_price']:.3f}")
+
     def get_stats(self):
         total = len(self.tracked_wallets) + len(self.network_wallets)
         return {

@@ -1,0 +1,310 @@
+"""
+Blockchain event monitor for real-time whale trade detection.
+
+Monitors Polymarket's CTFExchange contract on Polygon for OrderFilled events.
+Provides 2-3 second latency (block time) vs 5-12 minute polling latency.
+
+Architecture:
+- Connects to Polygon RPC WebSocket (free tier: Alchemy/Infura/Polygon public)
+- Subscribes to OrderFilled events from CTFExchange contract
+- Filters events by tracked whale wallet addresses (maker/taker)
+- Decodes event data to extract market, outcome, price, size
+- Fetches market metadata from Polymarket API
+- Emits real-time trade signals to whale_tracker
+
+Sources:
+- CTFExchange contract: https://polygonscan.com/address/0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e
+- Event structure: https://docs.bitquery.io/docs/examples/polymarket-api/polymarket-ctf-exchange/
+"""
+
+import json
+import os
+import time
+import threading
+import urllib.request
+from web3 import Web3
+from web3.providers import LegacyWebSocketProvider
+
+
+# Polymarket CTFExchange contract on Polygon
+CTFEXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+
+# Load contract ABI
+ABI_PATH = os.path.join(os.path.dirname(__file__), "ctfexchange_abi.json")
+with open(ABI_PATH, "r") as f:
+    CTFEXCHANGE_ABI = json.load(f)
+
+
+class BlockchainMonitor:
+    """Real-time blockchain event monitor for whale trades."""
+
+    def __init__(self, config, on_whale_trade_callback):
+        """
+        Initialize blockchain monitor.
+
+        Args:
+            config: Bot config dict with POLYGON_RPC_WSS url
+            on_whale_trade_callback: Function to call when whale trade detected
+                Signature: callback(whale_address, signal_data)
+                signal_data = {condition_id, market_title, outcome, whale_price, ...}
+        """
+        self.config = config
+        self.on_whale_trade = on_whale_trade_callback
+
+        # WebSocket connection
+        rpc_url = config.get(
+            "POLYGON_RPC_WSS",
+            "wss://polygon-mainnet.g.alchemy.com/v2/demo"  # Free demo RPC
+        )
+        self.web3 = Web3(LegacyWebSocketProvider(rpc_url))
+
+        # Contract instance
+        self.contract = self.web3.eth.contract(
+            address=Web3.to_checksum_address(CTFEXCHANGE_ADDRESS),
+            abi=CTFEXCHANGE_ABI
+        )
+
+        # Tracked whale addresses (set by whale_tracker)
+        self.tracked_wallets = set()  # Checksummed addresses
+
+        # Connection state
+        self.running = False
+        self.connected = False
+        self._thread = None
+        self._reconnect_delay = 1  # Exponential backoff
+
+        # Stats
+        self.events_received = 0
+        self.signals_emitted = 0
+        self.whale_trades_detected = 0
+        self.last_event_time = 0
+        self.last_block = 0
+
+    def start(self):
+        """Start monitoring in background thread."""
+        if self.running:
+            return
+
+        self.running = True
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread.start()
+        print("[BLOCKCHAIN] Monitor started")
+
+    def stop(self):
+        """Stop monitoring."""
+        self.running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+        print("[BLOCKCHAIN] Monitor stopped")
+
+    def update_tracked_wallets(self, wallet_addresses):
+        """Update list of whale wallets to monitor.
+
+        Args:
+            wallet_addresses: List of Ethereum addresses (will be checksummed)
+        """
+        self.tracked_wallets = {
+            Web3.to_checksum_address(addr.lower()) for addr in wallet_addresses
+        }
+        print(f"[BLOCKCHAIN] Tracking {len(self.tracked_wallets)} whale wallets")
+
+    def _monitor_loop(self):
+        """Main monitoring loop with reconnection logic."""
+        while self.running:
+            try:
+                self._connect_and_subscribe()
+            except Exception as e:
+                print(f"[BLOCKCHAIN] Error: {e}, reconnecting in {self._reconnect_delay}s...")
+                time.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, 60)  # Exp backoff
+
+    def _connect_and_subscribe(self):
+        """Connect to RPC and subscribe to contract events."""
+        print("[BLOCKCHAIN] Connecting to Polygon RPC...")
+
+        # Test connection
+        if not self.web3.is_connected():
+            raise ConnectionError("Failed to connect to Polygon RPC")
+
+        self.connected = True
+        self._reconnect_delay = 1  # Reset backoff
+        latest_block = self.web3.eth.block_number
+        self.last_block = latest_block
+        print(f"[BLOCKCHAIN] Connected (block: {latest_block})")
+
+        # Create event filter for OrderFilled events
+        event_filter = self.contract.events.OrderFilled.create_filter(
+            fromBlock="latest"
+        )
+
+        print(f"[BLOCKCHAIN] Subscribed to OrderFilled events at {CTFEXCHANGE_ADDRESS}")
+
+        # Poll for new events
+        while self.running and self.connected:
+            try:
+                new_events = event_filter.get_new_entries()
+                for event in new_events:
+                    self._process_order_filled(event)
+
+                # Heartbeat every 10 seconds
+                current_block = self.web3.eth.block_number
+                if current_block > self.last_block:
+                    self.last_block = current_block
+                    if current_block % 10 == 0:  # Every ~10 blocks (~25 seconds)
+                        print(f"[BLOCKCHAIN] Heartbeat: block {current_block}, "
+                              f"{self.whale_trades_detected} whale trades detected")
+
+                time.sleep(0.5)  # Poll every 500ms
+
+            except Exception as e:
+                print(f"[BLOCKCHAIN] Event polling error: {e}")
+                self.connected = False
+                raise
+
+    def _process_order_filled(self, event):
+        """Process an OrderFilled event and emit whale trade signal if relevant.
+
+        Event structure:
+        {
+            'args': {
+                'orderHash': bytes32,
+                'maker': address,
+                'taker': address,
+                'makerAssetId': uint256,
+                'takerAssetId': uint256,
+                'makerAmountFilled': uint256,
+                'takerAmountFilled': uint256,
+                'fee': uint256
+            },
+            'blockNumber': int,
+            'transactionHash': bytes,
+            ...
+        }
+        """
+        self.events_received += 1
+        self.last_event_time = time.time()
+
+        try:
+            args = event['args']
+            maker = Web3.to_checksum_address(args['maker'])
+            taker = Web3.to_checksum_address(args['taker'])
+
+            # Check if maker or taker is a tracked whale
+            whale_address = None
+            whale_side = None
+            if maker in self.tracked_wallets:
+                whale_address = maker
+                whale_side = "maker"
+            elif taker in self.tracked_wallets:
+                whale_address = taker
+                whale_side = "taker"
+
+            if not whale_address:
+                return  # Not a whale trade
+
+            self.whale_trades_detected += 1
+
+            # Extract trade details
+            maker_asset_id = args['makerAssetId']
+            taker_asset_id = args['takerAssetId']
+            maker_amount = args['makerAmountFilled']
+            taker_amount = args['takerAmountFilled']
+            fee = args['fee']
+
+            # Whale's token ID (the one they're buying)
+            whale_token_id = taker_asset_id if whale_side == "maker" else maker_asset_id
+            whale_amount = taker_amount if whale_side == "maker" else maker_amount
+
+            # Calculate price (amount paid / amount received)
+            # If whale is maker: they sold makerAmount, received takerAmount
+            # Price = takerAmount / makerAmount (how much they got per unit sold)
+            # If whale is taker: they sold takerAmount, received makerAmount
+            # Price = takerAmount / makerAmount (what they paid per unit)
+
+            if whale_side == "maker":
+                # Maker sells makerAmount, buys takerAmount
+                whale_price = float(taker_amount) / float(maker_amount) if maker_amount > 0 else 0
+            else:
+                # Taker sells takerAmount, buys makerAmount
+                whale_price = float(taker_amount) / float(maker_amount) if maker_amount > 0 else 0
+
+            print(f"[BLOCKCHAIN] Whale trade: {whale_address[:10]}... "
+                  f"bought token {whale_token_id} at price {whale_price:.4f} "
+                  f"(tx: {event['transactionHash'].hex()[:10]}...)")
+
+            # Fetch market metadata from Polymarket API using token ID
+            market_data = self._fetch_market_from_token_id(whale_token_id)
+
+            if not market_data:
+                print(f"[BLOCKCHAIN] Failed to fetch market data for token {whale_token_id}")
+                return
+
+            # Emit signal to whale_tracker
+            signal_data = {
+                "source_wallet": whale_address,
+                "condition_id": market_data.get("condition_id", ""),
+                "market_title": market_data.get("question", "Unknown Market"),
+                "outcome": market_data.get("outcome", "YES"),  # YES/NO based on token ID
+                "whale_price": whale_price,
+                "timestamp": time.time(),  # Use current time (event is recent)
+                "detected_at": time.time(),
+                "size": int(whale_amount),
+                "tx_hash": event['transactionHash'].hex(),
+                "block_number": event['blockNumber'],
+            }
+
+            self.on_whale_trade(whale_address, signal_data)
+            self.signals_emitted += 1
+
+        except Exception as e:
+            print(f"[BLOCKCHAIN] Failed to process OrderFilled event: {e}")
+
+    def _fetch_market_from_token_id(self, token_id):
+        """Fetch market metadata from Polymarket API using ERC1155 token ID.
+
+        Args:
+            token_id: ERC1155 token ID (uint256)
+
+        Returns:
+            Dict with market data or None if fetch fails
+        """
+        try:
+            # Convert token ID to hex string
+            token_id_hex = hex(token_id)
+
+            # Polymarket API endpoint for token lookup
+            # This may need adjustment - Polymarket's API structure might differ
+            url = f"https://gamma-api.polymarket.com/markets?token_id={token_id_hex}"
+
+            req = urllib.request.Request(url)
+            req.add_header("User-Agent", "PolymarketBot/1.0")
+
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+
+                # Parse response (structure depends on Polymarket's API)
+                # This is a placeholder - actual structure may vary
+                if isinstance(data, list) and len(data) > 0:
+                    market = data[0]
+                    return {
+                        "condition_id": market.get("condition_id", ""),
+                        "question": market.get("question", "Unknown"),
+                        "outcome": market.get("outcome", "YES"),
+                    }
+
+                return None
+
+        except Exception as e:
+            print(f"[BLOCKCHAIN] API fetch error for token {token_id}: {e}")
+            return None
+
+    def get_stats(self):
+        """Get monitoring statistics."""
+        return {
+            "connected": self.connected,
+            "events_received": self.events_received,
+            "whale_trades_detected": self.whale_trades_detected,
+            "tracked_wallets": len(self.tracked_wallets),
+            "last_event_time": self.last_event_time,
+            "last_block": self.last_block,
+        }

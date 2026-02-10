@@ -4,7 +4,7 @@ import getpass
 import uuid
 
 CONFIG_PATH = "config/config.json"
-CONFIG_VERSION = 10  # Bump to force-upgrade defaults
+CONFIG_VERSION = 12  # v12: Real-time blockchain monitoring (2-3s latency vs 5-12min polling)
 
 
 def load_or_create_config():
@@ -42,8 +42,35 @@ def load_or_create_config():
         config["SL_FAST_PCT"] = 0.12         # Fast markets: -12% SL
         config["TP_SLOW_PCT"] = 0.30         # Other markets: +30% TP (let winners run)
         config["SL_SLOW_PCT"] = 0.15         # Other markets: -15% SL (cut losers early)
+        # Arb scanner disabled: negative EV (all 4 LLM reviews agreed)
+        config["ENABLE_ARB_SCANNER"] = False  # HFT competition + two-leg risk = losses
         dirty = True
         print("[*] Config v10 — Dynamic TP/SL: fast 20/12%, slow 30/15%, reward > risk")
+
+    # v11: FATAL bug fixes
+    if config.get("_config_version", 0) < 11:
+        config["_config_version"] = 11
+        config["PAPER_BALANCE"] = 100.0  # Start paper trading at $100
+        dirty = True
+        print("[*] Config v11 — FATAL FIXES:")
+        print("    - Fee calculation: now uses curved Polymarket formula")
+        print("    - Staleness: now measures from whale's trade time (not detection time)")
+        print("    - Exposure persistence: now saved to data/risk_state.json")
+        print("    - Arb scanner: DISABLED (negative EV per 4 LLM reviews)")
+        print("    - Paper balance: starting at $100 (was $1000)")
+
+    # v12: Real-time blockchain monitoring
+    if config.get("_config_version", 0) < 12:
+        config["_config_version"] = 12
+        # Blockchain monitoring via Polygon RPC WebSocket (2-3s latency vs 5-12min polling)
+        config["USE_BLOCKCHAIN_MONITOR"] = True  # Enable real-time blockchain monitoring
+        config["POLYGON_RPC_WSS"] = ""  # User must provide Alchemy/Infura WebSocket URL
+        dirty = True
+        print("[*] Config v12 — REAL-TIME BLOCKCHAIN MONITORING:")
+        print("    - Monitors CTFExchange contract on Polygon for whale trades")
+        print("    - Latency: 2-3 seconds (block time) vs 5-12 minutes (polling)")
+        print("    - Requires Alchemy/Infura WebSocket URL in POLYGON_RPC_WSS")
+        print("    - Get free WSS URL: https://dashboard.alchemy.com/apps")
 
     # Select mode FIRST so we know whether credentials are needed
     if "MODE" not in config:
@@ -53,6 +80,21 @@ def load_or_create_config():
         print("3. Live (Real money)")
         sel = input("Choice [1]: ").strip() or "1"
         config["MODE"] = {"1": "PAPER", "2": "SHADOW", "3": "LIVE"}.get(sel, "PAPER")
+        dirty = True
+
+    # Polygon RPC WebSocket URL (for blockchain monitoring)
+    if config.get("USE_BLOCKCHAIN_MONITOR", False) and not config.get("POLYGON_RPC_WSS"):
+        print("\n[*] Blockchain monitoring enabled — requires Polygon RPC WebSocket URL")
+        print("    Get free URL from Alchemy: https://dashboard.alchemy.com/apps")
+        print("    1. Create app → Polygon Mainnet")
+        print("    2. Copy the WEBSOCKETS URL (wss://polygon-mainnet.g.alchemy.com/v2/...)")
+        print("    3. Paste below (or press Enter to skip and use polling mode)")
+        wss_url = input("Polygon RPC WSS URL: ").strip()
+        if wss_url:
+            config["POLYGON_RPC_WSS"] = wss_url
+        else:
+            config["USE_BLOCKCHAIN_MONITOR"] = False
+            print("    [!] Blockchain monitor disabled — using polling mode (5-12min latency)")
         dirty = True
 
     # API credentials — PAPER mode doesn't need real keys

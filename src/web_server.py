@@ -46,6 +46,8 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
             "/api/scorer": self._api_scorer,
             "/api/flows": self._api_flows,
             "/api/stress": self._api_stress,
+            "/api/blockchain": self._api_blockchain,
+            "/api/live_trades": self._api_live_trades,
         }
 
         handler = routes.get(path)
@@ -244,6 +246,57 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Paper trading not active"})
             return
         self._send_json(pe.stress.get_stats())
+
+    def _api_blockchain(self):
+        """Return blockchain monitor status and metrics."""
+        bot = self.server.bot_ref
+        if not bot.blockchain_monitor:
+            self._send_json({"enabled": False, "reason": "Blockchain monitor not configured"})
+            return
+
+        monitor = bot.blockchain_monitor
+        data = {
+            "enabled": True,
+            "connected": monitor.web3.is_connected() if hasattr(monitor, 'web3') else False,
+            "running": monitor.running,
+            "wallets_tracked": len(monitor.tracked_wallets),
+            "events_processed": monitor.events_received,
+            "signals_emitted": monitor.signals_emitted,
+            "last_event_time": monitor.last_event_time,
+        }
+
+        # Get current block if connected
+        if data["connected"]:
+            try:
+                data["current_block"] = monitor.web3.eth.block_number
+            except:
+                data["current_block"] = None
+
+        self._send_json(data)
+
+    def _api_live_trades(self):
+        """Return recent trades in real-time feed format."""
+        bot = self.server.bot_ref
+        wt = bot.whale_tracker
+
+        # Get recent signals (last 20)
+        signals = wt.get_recent_signals(limit=20)
+
+        # Format for live feed display
+        trades = []
+        for sig in signals:
+            trades.append({
+                "time": sig.get("detected_at", 0),
+                "wallet": sig.get("source_username", "Unknown")[:20],
+                "market": sig.get("market_title", "Unknown")[:50],
+                "side": sig.get("outcome", "?"),
+                "price": sig.get("whale_price", 0),
+                "size": sig.get("size", 0),
+                "source": sig.get("source", "api"),
+                "staleness": round(time.time() - sig.get("timestamp", time.time()), 1),
+            })
+
+        self._send_json({"trades": trades, "count": len(trades)})
 
     # ── Response Helpers ─────────────────────────────────────────
 

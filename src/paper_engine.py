@@ -422,7 +422,9 @@ class PaperTradingEngine:
             # timing drift, signal staleness, copy crowd, book depletion,
             # rate limiting, API failures, spread widening, off-hours penalty,
             # exponential decay near expiry
-            signal_age = time.time() - signal.get("detected_at", time.time())
+            # CRITICAL: Use whale's actual trade timestamp, not our detection time
+            whale_trade_time = signal.get("timestamp", signal.get("detected_at", time.time()))
+            signal_age = time.time() - whale_trade_time
             stress_result = self.stress.stress_entry(
                 whale_price=whale_price,
                 copy_budget=copy_budget,
@@ -453,9 +455,9 @@ class PaperTradingEngine:
 
             shares = copy_budget / our_price
 
-            # Fee lookup
+            # Fee lookup (use curved Polymarket formula)
             fee_bps = self._get_fee_rate(token_id)
-            fee = copy_budget * fee_bps / 10000
+            fee = calculate_trading_fee(our_price, shares, fee_bps)
             total_cost = copy_budget + fee + gas_fee
 
             # Balance check
@@ -590,9 +592,9 @@ class PaperTradingEngine:
             shares = pos["size"]
             gross_proceeds = shares * our_sell_price
 
-            # Fee on the sell side
+            # Fee on the sell side (use curved Polymarket formula)
             fee_bps = self._get_fee_rate(pos.get("token_id", ""))
-            fee = gross_proceeds * fee_bps / 10000
+            fee = calculate_trading_fee(our_sell_price, shares, fee_bps)
             net_proceeds = gross_proceeds - fee - gas_fee
 
             # Realized PnL
@@ -708,8 +710,9 @@ class PaperTradingEngine:
         shares = pos["size"]
         gross_proceeds = shares * our_sell_price
 
+        # Use curved Polymarket fee formula
         fee_bps = self._get_fee_rate(pos.get("token_id", ""))
-        fee = gross_proceeds * fee_bps / 10000
+        fee = calculate_trading_fee(our_sell_price, shares, fee_bps)
         net_proceeds = gross_proceeds - fee - gas_fee
 
         realized_pnl = net_proceeds - pos["total_cost"]

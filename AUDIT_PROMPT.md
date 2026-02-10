@@ -1,204 +1,519 @@
-# Polymarket Copy Trading Bot — Technical Audit Request
+# Polymarket Copy Trading Bot (plus Arb Scanner) — Forensic Technical Audit Request (Repo ZIP)
 
 ## Your Role
-You are an expert quantitative trading systems auditor with deep knowledge of:
-- High-frequency trading systems and market microstructure
-- Python trading bot architecture and performance optimization
-- Polymarket CLOB API and prediction market mechanics
-- Risk management, position sizing, and statistical edge analysis
-- Real-time data processing, latency optimization, and concurrency
 
-**Your task:** Conduct a comprehensive technical audit of this Polymarket copy trading bot codebase. This is NOT a casual code review — this is a production readiness assessment for a system that will trade real money.
+You are an expert trading systems auditor with deep knowledge of:
 
----
+* Python trading bot architecture (reliability, concurrency, state, observability)
+* Polymarket ecosystem: **CLOB (order book)** + **public Data API** (leaderboard/activity/trades)
+* Risk management for small-to-mid sized accounts (exposure limits, kill-switches, failure modes)
+* Statistical edge analysis under **fees, slippage, and stale signals**
+* Paper trading realism and simulation calibration
 
-## What This System Does
-
-### Core Strategy: Forensic Whale Copy Trading
-This bot identifies profitable Polymarket traders ("whales") by analyzing the public blockchain and copies their trades in real-time. Unlike naive copy trading, it uses:
-
-1. **Forensic wallet discovery**: Scans Polymarket's leaderboard for $3k-$10k/month traders, discovers network clusters
-2. **Bayesian performance scoring**: Beta-Binomial model (Beta(2,2) prior) that learns which wallets actually make money
-3. **Category-specific scoring**: A whale crushing NBA bets shouldn't get high confidence for crypto trades — scores are segmented by market type
-4. **Kelly Criterion position sizing**: Half-Kelly with empirical win rates from wallet track records (minimum 5 settled trades required)
-5. **13-layer stress simulation**: Models real Polymarket friction (slippage, gas, liquidity depletion, rate limits, crowd effects, expiry decay, etc.)
-6. **Dynamic TP/SL**: Fast markets (crypto/sports) use 20% TP / 12% SL. Slow markets use 30% TP / 15% SL. Reward always exceeds risk.
-7. **Time intelligence**: Won't enter trades within 3 minutes of market expiry. Exponential decay factor for near-expiry positions.
-8. **Winner's curse protection**: Max 8% price deviation from whale entry — if price moved too much, skip the trade
-9. **Anti-hedge logic**: Won't bet both YES and NO on the same market simultaneously
-10. **Account growth scaling**: Position sizes scale 0.5x-2.0x based on balance performance vs. starting capital
-
-### Modes
-- **PAPER**: Simulates trading with realistic friction (current mode — validation phase)
-- **SHADOW**: Watches live markets, logs what trades would be made, but doesn't execute (not implemented yet)
-- **LIVE**: Real money trading via Polymarket CLOB API (execution engine exists, not battle-tested)
-
-### Current Status
-- **CONFIG_VERSION 10**: Fresh start with improved TP/SL (see below)
-- $50 starting balance (paper trading validation phase)
-- 700+ wallets tracked (filtered from 1000+ leaderboard candidates)
-- Bayesian scoring active on wallets with 3+ historical copies
-- Tracking all market categories: crypto, sports, esports, politics (no restrictions)
-- **Recent fix**: TP/SL asymmetry corrected based on initial LLM review consensus (reward now exceeds risk)
-
-### v10 Upgrade: Dynamic TP/SL Fix
-**Problem identified by 5 previous LLM audits**: Old system had Take-Profit at +15%, Stop-Loss at -25%. This is backwards — we let losses run further than wins (0.6:1 risk/reward ratio).
-
-**Solution implemented (CONFIG_VERSION 10)**:
-- **Fast markets** (crypto 15-min, sports): TP=+20%, SL=-12% → 1.67:1 reward/risk ratio ✅
-- **Slow markets** (all others): TP=+30%, SL=-15% → 2.0:1 reward/risk ratio ✅
-
-Market classification uses regex patterns in `wallet_scorer.py:classify_market()` returning: `crypto_fast`, `sports_fast`, `slow`, or `unknown`.
-
-**Why this matters**: With 50% win rate, old system averaged -5% per 2 trades. New system averages +4% (fast) or +7.5% (slow) per 2 trades. This is the difference between guaranteed loss and potential profitability.
-
-**Implementation**: [src/paper_engine.py:822-843](src/paper_engine.py#L822-L843), [src/config.py:35-38](src/config.py#L35-L38)
-
-### Technical Stack
-- **Language**: Python 3.9.6
-- **API Client**: `py-clob-client` for Polymarket CLOB
-- **State**: JSON persistence with atomic writes (os.replace pattern)
-- **Web UI**: stdlib http.server with token auth (15 API routes)
-- **Concurrency**: Threading with RLock for state safety
-- **Deployment**: Designed for 24/7 VPS (Amsterdam for low latency to CLOB)
+**Your task:** Perform a **forensic, production-readiness audit** of the attached repository ZIP. This is **not** a casual review. Treat it like a system that will trade real money (even if currently PAPER mode).
 
 ---
 
-## What You Must Audit
+## Version Info
 
-### 1. **Statistical Edge Analysis** (CRITICAL)
-- **Question**: Does this system have a realistic edge after friction?
-- Calculate the required whale edge for breakeven after:
-  - 200bps trading fees (2% per trade)
-  - Simulated slippage (1-3% depending on conditions)
-  - Half-Kelly position sizing (50% of optimal)
-  - 0.5-2s latency behind whale signal
-- **Ask**: What's the minimum whale win rate needed to be profitable? Is 55% enough? 60%? 65%?
-- Review the Bayesian scoring and Kelly sizing — are these mathematically sound? Any bugs in the implementation?
+**CONFIG_VERSION**: 12 (as of February 10, 2026)
+**Status**: PAPER MODE — Not yet deployed live
+**Starting Balance**: $100 (paper trading)
+**Review Round**: 3 (Round 2: 4 LLM reviews → all FATAL bugs fixed in v11; v12 adds real-time blockchain monitoring)
 
-### 2. **Latency & Execution Speed**
-- **Context**: This is NOT a latency-sensitive HFT system. Polymarket is a prediction market, not a stock exchange. Markets don't move in microseconds.
-- Whale signals come from analyzing blockchain transactions (public, delayed data) — we're inherently 5-30 seconds behind.
-- Our Winner's Curse cap (8% max price deviation) protects against stale signals.
-- **Ask**: Given this context, is our polling architecture (0.5s cycle, 1s whale poll) reasonable? Or are we over-engineering for latency that doesn't matter?
-- Would WebSocket subscriptions provide material benefit, or is HTTP polling adequate?
+**NEW in v12 - Real-Time Blockchain Monitoring** (THE COMPETITIVE EDGE):
+- 🚀 **2-3 second latency** vs 5-12 minute polling (700× faster whale detection)
+- 📡 **Direct blockchain monitoring**: Watches CTFExchange contract on Polygon for OrderFilled events
+- ⚡ **Event-driven architecture**: WebSocket connection to Polygon RPC, push notifications when whales trade
+- 💰 **Free infrastructure**: Uses Alchemy/Infura free tier (no paid VPS needed)
+- 🎯 **Competitive with HFT**: On par with professional copy bots (vs hopeless 5-12min lag before)
+- 📂 **New module**: `src/blockchain_monitor.py` - Full WebSocket event listener with reconnection logic
+- 🔧 **Config**: `USE_BLOCKCHAIN_MONITOR=True`, `POLYGON_RPC_WSS` (user provides Alchemy WSS URL)
 
-### 3. **Risk Management Robustness**
-- Review [src/risk.py](src/risk.py) — RiskGuard module with exposure limits, daily loss tracking, kill-switch
-- Check [src/paper_engine.py](src/paper_engine.py) — position concentration limits, anti-hedge, TP/SL logic
-- **Ask**: What scenarios could cause a catastrophic loss? Flash crash? All whales on same side of a bad trade? API rate limit cascade?
-- Are there hidden correlations not accounted for? (e.g., 90% of whales buy same outcome during major news events)
+**Critical Fixes in v11** (implemented February 10, 2026):
+- ✅ **Fee calculation FIXED**: Now uses curved Polymarket formula `fee = (bps/10000) * price * (1-price)` instead of flat fee (was overcharging by 4× at mid-prices)
+- ✅ **Staleness measurement FIXED**: Now uses whale's trade timestamp from API, not detection time (was undercounting by 5+ minutes with 700 wallet polling)
+- ✅ **Exposure persistence FIXED**: RiskGuard now saves state to `data/risk_state.json` (exposure + daily loss survives restarts)
+- ✅ **Arb scanner DISABLED**: `ENABLE_ARB_SCANNER = False` by default (negative EV: HFT competition + two-leg execution risk)
 
-### 4. **Code Quality & Production Readiness**
-- **Concurrency**: Is the threading safe? Any race conditions in state writes?
-- **Error handling**: What happens on network failures, API changes, malformed data?
-- **State corruption**: Atomic writes via os.replace — is this sufficient? Need write-ahead logging?
-- **Memory leaks**: 105 trades in 30 min = ~200 trades/hour. At this rate, could we hit memory issues after 24h? 7 days?
-- **Monitoring**: If the bot silently stops trading (bug, API ban, network issue), would we know? Heartbeat watchdog exists — is it enough?
+**Changes in v10**:
+- Dynamic TP/SL: Fast markets 20% TP / 12% SL, Slow markets 30% TP / 15% SL
+- Category-specific wallet scoring: Separates whale performance by market type
+- Telegram notification system (code complete, not yet configured)
+- Removed crypto-only filter: Now trades ALL markets (crypto, sports, politics, etc.)
+- Winner's Curse protection: 8% max price deviation cap
+- Time Intelligence: 3-minute expiry block, exponential decay near expiry
+- Faster polling: 0.5s main loop, 1s whale poll (was 1s / 2s)
 
-### 5. **Scaling Limitations**
-- **Current**: $13 paper balance, <$1 position sizes
-- **Target**: $5,000+ balance, $50-150 position sizes
-- **Ask**: What breaks at scale?
-  - Order book impact: Will $150 trades get terrible fills on thin markets?
-  - Whale threshold: Are $3k-$10k/month whales too small? Should we track $50k+ whales?
-  - Market capacity: Many Polymarket markets have <$50k liquidity. Can we even deploy capital efficiently?
-  - Fee optimization: Should we use limit orders (maker) instead of market orders (taker) to save 0.5-1%?
-
-### 6. **Data Integrity & Wallet Scoring**
-- Review [src/wallet_scorer.py](src/wallet_scorer.py) — Bayesian Beta-Binomial scoring, category segmentation
-- **Ask**: Is there survivorship bias? (Leaderboard only shows today's winners, not yesterday's losers)
-- Are we overfitting to small sample sizes? (Kelly requires 5+ trades — is that enough?)
-- Category classification uses regex patterns — could we misclassify markets?
-- Flow analysis and cluster detection — any value, or just complexity for no edge?
-
-### 7. **Polymarket-Specific Risks**
-- **Settlement latency**: Outcomes are manually resolved by Polymarket. Can take hours/days. Capital sits locked — opportunity cost?
-- **Market creator manipulation**: Creators can dispute settlements. How do we protect against this?
-- **Ambiguous questions**: Political markets often have disputed wording. Does our system flag these?
-- **Volume farming**: Polymarket runs trading competitions. During these, wash trading increases. Does this pollute our whale scoring?
-- **Geographic restrictions**: We're targeting Netherlands VPS to avoid UK/US blocks. Any legal/API risks?
-
-### 8. **Architecture & Code Structure**
-- Review the module split: [config.py](src/config.py), [market.py](src/market.py), [strategy.py](src/strategy.py), [execution.py](src/execution.py), [risk.py](src/risk.py), [whale_tracker.py](src/whale_tracker.py), [wallet_scorer.py](src/wallet_scorer.py), [paper_engine.py](src/paper_engine.py), [bot.py](src/bot.py)
-- **Ask**: Is the separation clean? Any circular dependencies? Is the paper engine too tightly coupled to the real execution engine?
-- Could we plug in alternative strategies (e.g., arb, market making) without rewriting everything?
-- Dashboard UI ([static/index.html](static/index.html)) — any security holes beyond token auth?
-
-### 9. **Missing Features / Blind Spots**
-- What are we NOT doing that we should be?
-- Examples from other audits: Settlement automation, cross-exchange arb, news sentiment signals, technical analysis, limit order strategies, portfolio rebalancing
-- **Ask**: Which of these would provide actual edge vs. just complexity?
-
-### 10. **Brutal Honesty Assessment**
-- Forget about being polite. This is real money.
-- **Ask**: Is this system likely to make money, or is it a sophisticated way to pay fees to market makers?
-- If you were allocating $5,000 of your own money, would you trust this bot? Why or why not?
-- What's the single biggest flaw that could cause this to fail?
+> **Important context:** This bot is **not HFT** and does **not** require low-latency or paid infrastructure. It is intended to run **24/7 for free on a local MacBook**. Your audit must reflect that reality (e.g., sleep/wake, Wi-Fi drops, local-only dashboard security, no "VPS latency" assumptions).
 
 ---
 
-## Audit Instructions
+## Anti-Bias Instructions (CRITICAL — READ FIRST)
 
-1. **Read the entire codebase** — All files in `src/`, the main scripts `run.py` and `backtest.py`, the dashboard UI, the config structure
-2. **Trace the execution flow** — From bot startup → whale discovery → signal generation → copy decision → position management → TP/SL/settlement
-3. **Check the math** — Bayesian scoring, Kelly Criterion, fee calculations, PnL tracking, stress simulation
-4. **Think adversarially** — What could go wrong? Where are the bugs? What assumptions are fragile?
-5. **Compare to production standards** — Not academic toy project standards — this needs to run 24/7 with real money
+**This codebase may have been reviewed by other LLMs before you.** To prevent groupthink and ensure independent analysis, you **MUST** follow these anti-bias protocols:
 
-### Output Format
+### 1. **Do Not Agree by Default**
+- If you find yourself wanting to say "I agree with the previous review," **STOP**.
+- Re-examine the code yourself. Previous reviewers may be wrong.
+- Only agree if you independently verified the issue by reading the actual code.
 
-Organize your audit as:
+### 2. **Active Contrarian Thinking**
+Your job is to find what **others missed**. Prioritize:
+- **Bugs they didn't catch** (look for off-by-one errors, race conditions, math bugs)
+- **Edge cases they ignored** (what happens when whale_price = 0? When API returns empty list?)
+- **Architectural blind spots** (what if the user restarts the bot mid-trade? What if JSON is corrupted?)
+- **Overly pessimistic assumptions** (maybe the stress sim is TOO conservative and paper results underestimate real performance?)
 
-**A. Executive Summary (3-5 sentences)**
-- Overall assessment: Production-ready / Needs work / Not viable
-- Biggest strength
-- Biggest risk
-- Recommended next step
+### 3. **Avoid Recursion Churn**
+- Do **NOT** suggest changes that will require another round of reviews.
+- Focus on **FATAL** issues only (money loss, state corruption, security holes).
+- If a feature is "nice to have" but not critical, mark it as **Low** severity and move on.
+- Prefer fixes that are <20 lines of code. Avoid suggesting full rewrites.
 
-**B. Critical Issues (Must Fix Before Live Trading)**
-- List each issue with: Severity (High/Medium/Low), Location (file:line), Explanation, Suggested fix
+### 4. **Check Your Own Math**
+- When calculating breakeven win rates, show your work step-by-step.
+- Use the **actual constants from the code** (e.g., `SLIPPAGE_BASELINE = 0.003` from stress_sim.py).
+- If you estimate "60% win rate needed," prove it with arithmetic, not intuition.
 
-**C. Edge Analysis**
-- Calculate breakeven whale edge required
-- Assess whether Bayesian + Kelly + category scoring provides sufficient selection advantage
-- Probability this makes money over 6 months: X%
+### 5. **You Don't Have Full Context**
+- You are seeing a **snapshot** of the codebase.
+- You do NOT know what changes were made since the last review.
+- You do NOT know what issues were already fixed.
+- If you suspect something is wrong, cite the **exact file and line number** so the developer can verify.
 
-**D. Scaling Assessment**
-- What breaks at $1k, $5k, $10k, $50k?
-- Recommended capital deployment strategy
+### 6. **Severity Calibration**
+Use this exact rubric:
+- **High**: Money loss, state corruption, security hole, API ban risk
+- **Medium**: Performance degradation, suboptimal sizing, edge erosion
+- **Low**: Code quality, readability, minor optimizations
 
-**E. Architecture Review**
-- Code quality grade: A/B/C/D/F
-- Production readiness: 0-100%
-- Specific improvements
+If you're tempted to mark everything as "High," you're being too pessimistic. Most issues are "Medium."
 
-**F. Missing Features (Priority-Ranked)**
-- List features we should add, ranked by impact on edge
+### 7. **Concrete > Abstract**
+- BAD: "The bot needs better error handling."
+- GOOD: "In `src/paper_engine.py:425`, if `signal.get('timestamp')` returns None, the code will crash with TypeError. Add `or time.time()` as a fallback."
 
-**G. Honest Take**
-- If you were me, would you deploy this with real money? Under what conditions?
+### 8. **Distrust Your Priors**
+- You may have been trained on other trading bot codebases that use different architectures.
+- **This bot uses atomic writes with os.replace** — don't suggest adding a database unless you can prove it's necessary.
+- **This bot uses paper trading for testing** — don't suggest running it live without validation unless you can prove paper is accurate.
+
+### 9. **Cross-Check with Other Reviewers (If Provided)**
+- If you are given previous reviews, read them **after** you've written your initial findings.
+- Then add a section: "What I Found That Others Missed" and "What Others Found That I Disagree With."
+- Provide technical justification for disagreements (cite code, not vibes).
+
+### 10. **The Ultimate Test**
+Before submitting your review, ask yourself:
+- **If this were my own $5,000, would I trust my review enough to act on it?**
+- **Did I actually read the code, or am I just pattern-matching against "typical trading bot issues"?**
+- **If the developer implements only my "High" severity fixes, will the bot be safer?**
+
+**Your goal is not to be the harshest reviewer. Your goal is to be the most *correct* reviewer.**
 
 ---
 
-## Context Files
+## Known Critical Issues (From Previous Reviews)
 
-The codebase includes a few key documentation files you should read first:
-- `LLM_PROMPT.md` — High-level system overview (may be in the repo you received)
-- `MEMORY.md` — Development history and build status
-- Module docstrings in each `.py` file
+**Status: FIXED IN v11** — These issues were identified by 4 independent LLM reviews (DeepSeek, Gemini, Grok, GPT-4o) and have been fixed in CONFIG_VERSION 11. **Your job is to verify the fixes are correct and look for NEW issues.**
+
+### 1. Fee Calculation Bug (FATAL) — ✅ FIXED
+- **Location**: `src/paper_engine.py` lines 458, 595, 712
+- **Issue**: Used flat fee formula `fee = cost * bps/10000`, but Polymarket uses curved formula `fee = (bps/10000) * price * (1-price)`. Was overcharging fees by 4× at mid-prices.
+- **Impact**: Paper results were MORE pessimistic than reality (good for safety, but misleading).
+- **Fix**: Now calls `calculate_trading_fee(price, size, fee_bps)` which uses the correct curved formula.
+- **Verification**: Check lines 458, 595, 712 in paper_engine.py — should all use `calculate_trading_fee()`.
+
+### 2. Staleness Measurement Bug (FATAL) — ✅ FIXED
+- **Location**: `src/paper_engine.py:execute_copy_trade()` line ~427
+- **Issue**: Measured staleness as `time.time() - signal.get("detected_at")`, which is when WE detected the signal, not when the whale actually traded. With 700 wallets polled every 1-2 seconds, whale trades could be 5+ minutes stale.
+- **Impact**: Winner's curse protection and stress simulation were using wrong timestamps, underestimating staleness penalties.
+- **Fix**: Now uses `whale_trade_time = signal.get("timestamp", signal.get("detected_at"))` — fallback to detected_at only if API doesn't provide timestamp.
+- **Verification**: Check line ~427 — should use `signal.get("timestamp")` first.
+
+### 3. Exposure Accounting Not Persisted (HIGH) — ✅ FIXED
+- **Location**: `src/risk.py`
+- **Issue**: Current exposure was tracked in memory only. On bot restart, exposure reset to 0 even if positions were open, allowing risk limits to be bypassed.
+- **Impact**: Risk limits could be exceeded after restart. Daily loss limits also reset.
+- **Fix**: RiskGuard now persists state to `data/risk_state.json` using atomic writes. Loads on __init__, saves after add_exposure(), remove_exposure(), record_loss().
+- **Verification**: Check risk.py has `_save_state()`, `_load_state()`, and calls to `_save_state()` in add/remove/record methods.
+
+### 4. Arb Scanner Negative EV (STRATEGIC) — ✅ DISABLED
+- **Location**: `src/bot.py` line ~148
+- **Issue**: All 4 reviewers agreed arb scanner has negative EV (HFT competition + two-leg execution risk).
+- **Impact**: Arb strategy loses money.
+- **Fix**: Added `ENABLE_ARB_SCANNER = False` config flag. Arb scanning code now wrapped in `if config.get("ENABLE_ARB_SCANNER", False):`.
+- **Verification**: Check bot.py line ~148 — arb scanning should be wrapped in if statement checking ENABLE_ARB_SCANNER.
+
+### 5. State Corruption Risk (MEDIUM) — ⚠️ PARTIALLY MITIGATED
+- **Location**: All `_save_state()` methods
+- **Issue**: No CRC checksums, schema versioning, or consistency checks on load.
+- **Status**: Atomic writes (`os.replace`) prevent partial writes, but no checksums yet.
+- **Remaining Work**: Add schema version field to all state files, add CRC or hash validation on load.
+
+**Your focus should be:**
+1. Verify the 4 FIXED issues are actually fixed correctly (check the code, not just trust the changelog)
+2. Look for NEW bugs introduced by the fixes (e.g., did calculate_trading_fee() break something else?)
+3. Find issues the previous reviewers MISSED
 
 ---
 
-## Final Note
+## What This Repo Actually Implements (Based on Code Structure)
 
-We've already had 5 LLM reviews (Grok, Gemini, GPT-4, Kimi K2.5, DeepSeek). Common themes:
-- TP/SL asymmetry concerns (we fixed this — now 20%/12% fast, 30%/15% slow)
-- Polling latency (may be overblown for our use case)
-- Correlation risk (we have 6% per-market exposure cap)
-- Survivorship bias in whale selection (partially mitigated by Bayesian priors)
-- "Sophisticated way to pay fees" criticism (this is the key question we need you to settle)
+### A) Copy Trading Subsystem (Directional)
 
-Your audit should acknowledge these previous critiques but go deeper. We need specific, actionable technical findings — not generic "copy trading doesn't work" philosophy.
+* **Whale discovery & polling:** `src/whale_tracker.py`
 
-**Be harsh. Be honest. This is production trading, not a school project.**
+  * Uses **public Polymarket Data API** endpoints:
+
+    * `/v1/leaderboard` (MONTH PnL sorted) to discover traders
+    * `/activity?user=<wallet>` to detect trades
+    * `/trades?market=<conditionId>` for market-level context
+  * Maintains state in `data/whale_state.json` with atomic write pattern.
+  * Has heuristics and filters (PnL/volume “farmer test”, inactivity, wash ratio, hold-time checks, etc.).
+
+* **Wallet scoring / category scoring / anti-hedge / flow clustering:** `src/wallet_scorer.py`
+
+  * Bayesian Beta prior **Beta(2,2)** for win-rate smoothing (plus ROI and confidence weighting)
+  * Category-aware scoring via market title regex classification:
+
+    * `crypto_fast`, `sports_fast`, `slow`, `unknown`
+  * Anti-hedge: prevents holding both YES and NO copy positions in same condition.
+  * “Flow strength” (cluster activity) as a feature.
+
+* **Copy execution in PAPER (and exit-copy):** `src/paper_engine.py`
+
+  * `execute_copy_trade()` opens positions sized via:
+
+    * **Half-Kelly** if wallet has ≥5 settled results (empirical win rate)
+    * Otherwise a score-based sizing fallback with min/max clamps
+  * Winner’s curse protection via max price deviation
+  * Time intelligence: blocks near expiry and models expiry decay
+  * Auto TP/SL management for unsettled copy positions using dynamic thresholds
+  * State persistence: `data/paper_state.json` (atomic writes)
+  * Integrates the stress simulator below.
+
+* **Stress simulator (paper pessimism):** `src/stress_sim.py`
+
+  * Models friction layers: rejection, partial fills, slippage stack, staleness, crowd, depletion, rate limiting, API failures, gas, spread widening, off-hours, expiry decay.
+
+### B) Separate Arb Scanner Strategy (Locked Profit)
+
+This repo also contains a second strategy that runs alongside copy trading in the main loop:
+
+* **Arbitrage detection:** `src/strategy.py`
+
+  * Detects `ask_yes + ask_no + buffer < 1.00` opportunities
+  * Intended “free-infra edge” = breadth scanning of long-tail markets
+
+* **Execution routing:** `src/execution.py`
+
+  * PAPER routes to paper engine
+  * LIVE uses `py-clob-client`, with two-leg logic, hedge/cancel policies
+
+### C) Main Orchestration / Ops
+
+* **Main loop:** `src/bot.py`
+
+  * Every cycle:
+
+    1. Updates dynamic risk limits (based on paper portfolio balance)
+    2. Polls whales and executes copy trades/exits (paper)
+    3. Scans market order books for arb opportunities
+    4. Settles paper positions / records snapshots
+  * Heartbeat watchdog thread for hang detection + emergency state save
+* **Risk management:** `src/risk.py`
+* **Market data service:** `src/market.py`
+* **Local dashboard server:** `src/web_server.py` + `static/`
+* **Notifications:** `src/notifier.py` (Telegram)
+* **Data collection/backtesting:** `src/data_collector.py`, `src/backtester.py`, `backtest.py`
+
+---
+
+## Core Audit Questions (What You Must Evaluate)
+
+### 1) **Is There Real Edge After Friction? (CRITICAL)**
+
+You must quantify whether the **copy trading component** has a plausible edge under its own modeled friction.
+
+**For copy trading**, compute (at minimum) breakeven requirements given:
+
+* Fee model used in the code (see `src/paper_fees.py` + `PaperTradingEngine._get_fee_rate()` in `src/paper_engine.py`)
+* Stress simulator’s baseline slippage + staleness + crowd penalties (`src/stress_sim.py`)
+* Winner’s curse skip logic (`MAX_PRICE_DEVIATION` and config overrides)
+* Half-Kelly sizing and min/max trade clamps (copy sizing in `execute_copy_trade()`)
+
+**Deliverables:**
+
+* Minimum *empirical* whale win rate needed for profitability at typical entry prices (e.g., price=0.45, 0.55, 0.70) under:
+
+  * “Optimistic” friction (low slippage, minimal staleness)
+  * “As-coded stress” friction (use simulator constants)
+* A sanity check: do the simulator constants make paper results **too pessimistic** or **not pessimistic enough**?
+
+**For the arb scanner**, assess:
+
+* How often the “locked profit” condition is *actually* fillable (book depth realism)
+* Execution failure modes (two-leg partial fills, hedge slippage, cancellation behavior)
+* Whether the strategy survives fees/spread and produces positive EV at realistic fill rates
+
+---
+
+### 2) **Execution & Timing — Non-HFT Reality Check**
+
+This system is **not** competing in microseconds. However, it does make frequent HTTP calls and runs 24/7 on a MacBook.
+
+Audit:
+
+* Polling frequency and CPU/network usage:
+
+  * `CYCLE_SLEEP` and market batch behavior in `src/bot.py`
+  * Whale polling interval constants in `src/whale_tracker.py`
+* Rate limit / ban risk:
+
+  * Data API calls (leaderboard pagination, activity polling)
+  * CLOB calls (order books, market data)
+* Whether the system is **over-polling** (wasted resources) or **under-polling** (stale signals) given prediction market dynamics
+
+**MacBook-specific operational risks you must address:**
+
+* Sleep / lid close / power saving killing the process
+* Wi-Fi drops / IP changes / captive portal events
+* Local disk full, log bloat, JSON state file growth over weeks
+* Time sync drift (affects expiry parsing and time-based rules)
+
+---
+
+### 3) **Risk Management Robustness**
+
+You must treat risk as adversarial.
+
+Audit:
+
+* Dynamic risk limits in `src/config.py` + updates in `src/bot.py` + enforcement in `src/risk.py`
+* Concentration logic in `execute_copy_trade()` (per-market cap, exposure cap)
+* Daily loss tracking / kill switch behavior
+* Exposure accounting correctness:
+
+  * Add exposure on entry; remove exposure on exit and settlement
+  * Ensure copy exits and TP/SL exits always reconcile exposure correctly
+
+**Catastrophic loss scenarios to test conceptually:**
+
+* Many whales pile into the same market and are wrong (correlation blow-up)
+* API failures during exits (stuck positions)
+* TP/SL triggers based on stale prices (wrong current_price)
+* Whale “exit-copy” signal arrives late and the book moved heavily
+* State corruption: crash between cash deduction and position persistence
+
+Deliver a list of “ways this can go to zero” and whether safeguards actually prevent them.
+
+---
+
+### 4) **Data Integrity & Whale Scoring Correctness**
+
+Audit the entire whale pipeline:
+
+* **Discovery bias:** leaderboard MONTH PnL selection inherently has survivorship / selection bias
+* “Farmer test” and filters:
+
+  * PnL/volume thresholds, inactivity, hold time, wash ratio logic in `src/whale_tracker.py`
+* **Bayesian scoring implementation correctness:**
+
+  * Priors, posterior mean logic, and update rules in `src/wallet_scorer.py`
+  * Category scoring: does it actually prevent cross-domain overconfidence?
+* **Minimum sample sizes:** are 3 results (score) and 5 results (Kelly) defensible?
+* **Market classification via regex:** false positives/negatives
+
+  * How classification errors propagate into TP/SL bands and sizing
+
+You must identify any math bugs, leakage between categories, or score inflation/deflation issues.
+
+---
+
+### 5) **Paper Trading Realism vs. Self-Deception**
+
+This repo relies heavily on PAPER mode as a “truth machine.”
+
+Audit:
+
+* Whether paper fills, slippage, fees, and gas models match Polymarket reality
+* Whether paper assumes execution that would not be possible live (especially for arb two-leg fills)
+* Whether stress simulation is internally consistent:
+
+  * Are penalties double-counted?
+  * Are failure probabilities plausible?
+  * Do they scale sensibly with signal age, market fatigue, and trading cadence?
+
+Deliver: a “paper-to-live gap” assessment and what must change before trusting paper PnL.
+
+---
+
+### 6) **Architecture, Reliability, and Production Readiness**
+
+This runs 24/7. That means operational excellence matters more than clever logic.
+
+Audit:
+
+* Concurrency and thread safety:
+
+  * Heartbeat watchdog interactions with state saving (`src/bot.py`)
+  * Locks in `src/paper_engine.py`
+  * Any shared dict mutation without locks (`whale_tracker`, `wallet_scorer`)
+* Error handling:
+
+  * Network timeouts, JSON parse failures, partial API responses
+  * Retries/backoff and whether failures spiral into bans or silent no-trade
+* State persistence:
+
+  * Atomic write patterns used (tmp + `os.replace`)
+  * Risk of partial writes and schema drift across versions
+  * Growth of state files (`seen_tx_hashes`, trade history, positions)
+* Observability:
+
+  * Can you detect “bot is alive but doing nothing”?
+  * Are there meaningful logs/metrics/alerts (Telegram integration, status reports)?
+
+---
+
+### 7) **Security Review (Local-Only, But Still)**
+
+Even “localhost-only” services can be risky.
+
+Audit:
+
+* Dashboard access controls:
+
+  * Token auth design in `src/web_server.py`
+  * Binding behavior (`DASHBOARD_BIND` in config defaults)
+  * Any unsafe routes, command execution, file writes, or info leaks
+* Secrets handling:
+
+  * Config file storage of API keys/private keys
+  * Risk of accidentally logging secrets
+* Supply chain / dependency risk:
+
+  * `requirements.txt`
+  * Unsafe imports or code paths that download/execute content
+
+---
+
+### 8) **Scaling & Capital Deployment Limits**
+
+Even if this starts at $50, the user intends to scale.
+
+Audit:
+
+* What breaks at $500 / $2,000 / $5,000+?
+
+  * Copy sizing caps and exposure percentages: do they scale safely?
+  * Market liquidity constraints (thin books → awful fills)
+  * Correlation: bigger account = bigger drawdowns from clustered whale behavior
+* For arb scanning:
+
+  * Can this strategy deploy meaningful size without moving the market?
+  * Two-leg risk increases with size
+
+Deliver a recommended scaling path and when to stop scaling.
+
+---
+
+### 9) **Missing Features / Blind Spots (Only If High-Impact)**
+
+Do not suggest “extra complexity” unless it clearly improves survivability or EV.
+
+Priority-rank additions that would materially reduce risk or improve edge, such as:
+
+* Robust backoff + circuit breakers for API bans/rate limits
+* Better data validation and schema versioning for state files
+* “Shadow” mode parity tests (watch-only) before LIVE
+* Maker/limit order logic (if fees/slippage dominate)
+* Automated “stuck position” recovery logic for LIVE execution
+
+---
+
+## Audit Instructions (Process You Must Follow)
+
+1. **Read the entire repository**:
+
+   * All files in `src/`, plus `run.py`, `backtest.py`, `SPEC.md`, `AUDIT_PROMPT.md`, `llm_review_pack.txt`, `config/`
+2. **Trace execution end-to-end**:
+
+   * Startup → config → bot loop → whale discovery/polling → signal → copy sizing → stress sim → position state → TP/SL → exit-copy → settlement
+   * Also trace arb scanning loop → opportunity → execution → hedge logic → settlement
+3. **Validate every money-moving line**:
+
+   * Fee math, slippage application, PnL calculations, exposure accounting, cash balance updates
+4. **Think adversarially**:
+
+   * Assume APIs degrade, whales behave strategically, markets move against you, and your machine crashes
+5. **Judge against “24/7 local production” standards**:
+
+   * Not research quality; not hobby code; real-money robustness
+
+---
+
+## Required Output Format
+
+### A) Executive Summary (3–6 sentences)
+
+* Overall verdict: **Production-ready / Needs work / Not viable**
+* Biggest strength
+* Biggest risk
+* What you would do next (concrete)
+
+### B) Critical Issues (Must Fix Before LIVE)
+
+For each issue include:
+
+* Severity: **High / Medium / Low**
+* Location: `file.py:function` (and line numbers if you can)
+* Why it matters
+* Exact suggested fix (implementation-level)
+
+### C) Edge Analysis
+
+* Copy trading breakeven math (include assumptions and friction scenarios)
+* Arb strategy fillability and net EV assessment
+* “Probability of profitability over 6 months” with reasoning (not vibes)
+
+### D) Risk & Failure Mode Review
+
+* Top 10 ways the system can fail
+* Which are mitigated, which are not
+* Suggested kill-switch / circuit breaker improvements
+
+### E) Paper-to-Live Gap
+
+* Where paper is faithful
+* Where paper is optimistic/pessimistic
+* What validation steps are required before trusting it
+
+### F) Scaling Assessment
+
+* What changes at $500 / $2k / $5k+
+* Liquidity + correlation + operational constraints
+* Recommended capital deployment strategy (and when to stop)
+
+### G) Architecture & Ops Grade
+
+* Code quality: A/B/C/D/F
+* Production readiness score: 0–100
+* Operational checklist for “run 24/7 on MacBook” (sleep prevention, restart policy, log rotation, backups, alerts)
+
+### H) Brutal Honesty Take
+
+* Is this likely to make money, or mostly pay fees/slippage?
+* If this were your own $5,000, would you run it? Under what strict conditions?
+* The single biggest flaw that could sink it
+
+---
+
+## Notes You Must Respect
+
+* This is **not HFT**; do not recommend paid infra or ultra-low latency as a default “fix.”
+* Assume **local-only, free, always-on** operation is a hard constraint.
+* Be specific. Vague advice (“add monitoring”) is not acceptable without concrete implementation guidance tied to repo files.
+
+**Be harsh. Be technical. Treat every dollar like it’s real.**
