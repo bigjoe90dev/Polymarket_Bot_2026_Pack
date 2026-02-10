@@ -1,5 +1,5 @@
 {
-  "_config_version": 9,
+  "_config_version": 10,
   "MIN_PROFIT": 0.003,
   "COST_BUFFER": 0.002,
   "MIN_LIQUIDITY": 0.5,
@@ -31,5 +31,9 @@
   "RISK_MAX_EXPOSURE_PCT": 0.5,
   "RISK_MAX_DAILY_LOSS_PCT": 0.3,
   "TELEGRAM_BOT_TOKEN": "",
-  "TELEGRAM_CHAT_ID": ""
+  "TELEGRAM_CHAT_ID": "",
+  "TP_FAST_PCT": 0.2,
+  "SL_FAST_PCT": 0.12,
+  "TP_SLOW_PCT": 0.3,
+  "SL_SLOW_PCT": 0.15
 }
