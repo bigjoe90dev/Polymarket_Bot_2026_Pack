@@ -1,5 +1,7 @@
 {
-  "_config_version": 15,
+  "_config_version": 16,
+  "USE_HOURLY_MARKETS": true,
+  "HOURLY_MARKET_IDS_FILE": "data/discovered_hourly_markets.json",
   "MIN_PROFIT": 0.003,
   "COST_BUFFER": 0.002,
   "MIN_LIQUIDITY": 0.5,
@@ -50,7 +52,9 @@
   "MAX_PRICE_CHASE_PCT": 0.05,
   "STATE_BACKUP_GENERATIONS": 5,
   "TREND_TIMEFRAME": "1h",
-  "TREND_ASSETS": ["BTC"],
+  "TREND_ASSETS": [
+    "BTC"
+  ],
   "TREND_USE_WS": true,
   "TREND_WS_RECONNECT_DELAY": 5,
   "TREND_WS_HEALTHY_THRESHOLD": 60,

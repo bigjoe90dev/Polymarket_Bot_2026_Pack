@@ -1,3 +1,6 @@
+import json
+import os
+from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import BookParams
 
@@ -9,6 +12,29 @@ class MarketDataService:
         self.config = config
         # L0 client: no auth needed for reading markets and order books
         self.client = ClobClient(CLOB_HOST)
+        
+        # Load hourly market IDs if enabled
+        self._hourly_market_ids = set()
+        if config.get("USE_HOURLY_MARKETS", False):
+            self._load_hourly_market_ids()
+    
+    def _load_hourly_market_ids(self):
+        """Load hourly market condition IDs from discovered markets file."""
+        ids_file = self.config.get("HOURLY_MARKET_IDS_FILE", "data/discovered_hourly_markets.json")
+        if os.path.exists(ids_file):
+            try:
+                with open(ids_file) as f:
+                    data = json.load(f)
+                
+                # Load condition IDs from one_hour markets
+                for market in data.get("one_hour", []):
+                    cid = market.get("condition_id")
+                    if cid:
+                        self._hourly_market_ids.add(cid.lower())
+                
+                print(f"[+] Loaded {len(self._hourly_market_ids)} hourly market condition IDs")
+            except Exception as e:
+                print(f"[!] Error loading hourly markets: {e}")
 
     def get_active_markets(self):
         """Spec 6.2: Pulls active markets (YES/NO only).
@@ -45,6 +71,29 @@ class MarketDataService:
                     no_token = t
 
             if yes_token and no_token:
+                # Filter for hourly markets if enabled
+                cond_id = m.get("condition_id", "").lower()
+                if self._hourly_market_ids and cond_id not in self._hourly_market_ids:
+                    continue
+                
+                # Filter: skip markets that resolve in more than X hours
+                end_date = m.get("endDate") or m.get("end_date")
+                if end_date:
+                    try:
+                        # Parse end date
+                        end_str = end_date.replace('Z', '+00:00')
+                        if '.' in end_str:
+                            end_str = end_str.split('.')[0] + '+00:00'
+                        end_dt = datetime.fromisoformat(end_str)
+                        now = datetime.now(timezone.utc)
+                        
+                        # Skip if more than 4 hours away (reduce to relevant set)
+                        hours_until = (end_dt - now).total_seconds() / 3600
+                        if hours_until > 4:
+                            continue
+                    except:
+                        pass
+                
                 all_markets.append({
                     "condition_id": m["condition_id"],
                     "yes_token_id": yes_token["token_id"],
@@ -52,7 +101,7 @@ class MarketDataService:
                     "yes_price": yes_token.get("price", 0),
                     "no_price": no_token.get("price", 0),
                     "title": m.get("question", ""),  # For fee classification
-                    "end_date": m.get("endDate") or m.get("end_date"),
+                    "end_date": end_date,
                 })
 
         return all_markets
