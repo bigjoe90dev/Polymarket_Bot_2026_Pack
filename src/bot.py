@@ -65,6 +65,16 @@ class TradingBot:
 
         # CLOB WebSocket monitor for ultra-low latency whale trades (~300ms vs 2-3s blockchain)
         self.clob_websocket = None
+        self._ws_healthy = False  # Track WebSocket health for fallback
+        self._ws_last_healthy_time = 0  # Track when WS last became healthy
+        
+        # Always create momentum strategy (works with both WebSocket and REST polling)
+        self.momentum_strategy = MomentumStrategy(
+            paper_engine=self.execution.paper_engine,
+            config=config,
+        )
+        print("[*] Momentum strategy initialized (1H trend-following, WS + REST fallback)")
+        
         if config.get("USE_CLOB_WEBSOCKET", False):
             def on_clob_trade(signal_data):
                 """Callback when CLOB WebSocket detects whale trade."""
@@ -73,20 +83,14 @@ class TradingBot:
             self.clob_websocket = CLOBWebSocketMonitor(config, on_clob_trade)
             print("[*] CLOB WebSocket monitor initialized (will start after whale discovery)")
             
-            # Momentum strategy for CLOB-based pattern trading
-            self.momentum_strategy = MomentumStrategy(
-                paper_engine=self.execution.paper_engine,
-                lookback_seconds=config.get("MOMENTUM_LOOKBACK", 60),
-                min_momentum=config.get("MOMENTUM_THRESHOLD", 0.02),
-                position_size=config.get("MOMENTUM_SIZE", 5.0),
-            )
-            print("[*] Momentum strategy initialized (CLOB pattern trading)")
-            
-            # Register momentum callback with CLOB websocket
+            # Register momentum callback with CLOB websocket (CONDITIONAL - may be None)
             def momentum_callback(token_id, price):
-                self.momentum_strategy.on_price_update(token_id, price)
+                if self.clob_websocket:
+                    self.momentum_strategy.on_price_update(token_id, price, source="ws")
             
-            self.clob_websocket.price_callback = momentum_callback
+            # Only assign if clob_websocket was successfully created
+            if self.clob_websocket:
+                self.clob_websocket.price_callback = momentum_callback
 
         # Telegram notifications
         self.notifier = TelegramNotifier(config)
@@ -140,7 +144,7 @@ class TradingBot:
                     )
                     if was_registered:
                         registered_count += 1
-            print(f"[*] Registered {registered_count}/{len(markets)} markets with momentum strategy (filtered by crypto Up/Down 5min/15min)")
+            print(f"[*] Registered {registered_count}/{len(markets)} markets with momentum strategy (filtered by 1H Up/Down crypto)")
 
         # Discover profitable traders from leaderboard ($3k-$10k/month)
         print("[*] Discovering profitable traders from leaderboard...")
@@ -220,6 +224,34 @@ class TradingBot:
 
             # Combine all signals: CLOB (fastest) > blockchain > polled
             signals = clob_signals + blockchain_signals + polled_signals
+
+            # ── Momentum Strategy: WS-first + REST fallback ─────
+            # Check WebSocket health and switch to REST polling if needed
+            if hasattr(self, 'momentum_strategy') and self.momentum_strategy:
+                ws_healthy = False
+                if self.clob_websocket and hasattr(self.clob_websocket, 'connected'):
+                    ws_healthy = self.clob_websocket.connected
+                
+                # Track WS health state
+                if ws_healthy:
+                    self._ws_healthy = True
+                    self._ws_last_healthy_time = now
+                else:
+                    # Check if we should switch back to WS (if it was healthy for 60s)
+                    if self._ws_healthy and (now - self._ws_last_healthy_time) > 60:
+                        self._ws_healthy = False
+                        print("[*] WS unhealthy for 60s, using REST polling fallback")
+                
+                # Use REST polling if WS is not healthy
+                if not ws_healthy and self.clob_websocket is None:
+                    # WS disabled entirely - use REST polling
+                    self.momentum_strategy.poll_prices(self.market, source="rest")
+                elif not ws_healthy and self.clob_websocket:
+                    # WS enabled but not connected - use REST polling
+                    self.momentum_strategy.poll_prices(self.market, source="rest")
+                
+                # Check exit conditions for open positions
+                self.momentum_strategy.check_exits()
 
             # v14: Record signal metrics
             if clob_signals:

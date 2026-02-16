@@ -39,7 +39,7 @@
   "ENABLE_ARB_SCANNER": false,
   "USE_BLOCKCHAIN_MONITOR": true,
   "POLYGON_RPC_WSS": "wss://polygon-mainnet.g.alchemy.com/v2/bv3H2O33-VKeHtKmU1fhI",
-  "USE_CLOB_WEBSOCKET": true,
+  "USE_CLOB_WEBSOCKET": false,
   "CLOB_WS_URL": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
   "METRICS_LOGGING_ENABLED": true,
   "METRICS_LOG_INTERVAL_SEC": 60,
@@ -50,7 +50,9 @@
   "MAX_PRICE_CHASE_PCT": 0.05,
   "STATE_BACKUP_GENERATIONS": 5,
   "TREND_TIMEFRAME": "1h",
-  "TREND_ASSETS": ["BTC"],
+  "TREND_ASSETS": [
+    "BTC"
+  ],
   "TREND_USE_WS": true,
   "TREND_WS_RECONNECT_DELAY": 5,
   "TREND_WS_HEALTHY_THRESHOLD": 60,

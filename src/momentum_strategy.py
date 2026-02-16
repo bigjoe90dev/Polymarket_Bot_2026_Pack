@@ -1,136 +1,439 @@
 """
-CLOB Momentum Strategy
-======================
-Monitors CLOB price streams for momentum patterns and executes trades.
+1H Trend-Following Strategy for Polymarket
+==========================================
+Phase 1: Paper-only, BTC only, 1H timeframe
 
-Strategy: Price going UP → Buy YES (bet on continuation)
-          Price going DOWN → Buy NO (bet on reversal)
+Signal Logic: 3-Layer Gating
+- Layer 0: Data Sanity (30s updates, 15min history)
+- Layer 1: Regime Filter (trendiness score > 0.3)
+- Layer 2: Entry Trigger (breakout + 5min return + cooldown)
 
-Focus: Bitcoin/Ethereum "Up or Down" markets (high frequency, short duration)
+Exit Rules:
+- Take Profit: +8 ticks
+- Stop Loss: -3 cents
+- Trailing MA: 20-period
+- Max Hold: 45 minutes
+
+Confidence Scoring: Do nothing when unsure (confidence < 0.5)
 """
 
 import time
-import asyncio
-from collections import defaultdict
+import threading
+import re
+from collections import defaultdict, deque
 from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
 
 
-class MomentumTracker:
-    """Track price momentum for each token."""
+@dataclass
+class PricePoint:
+    """Single price update with timestamp."""
+    timestamp: float
+    price: float
+    source: str = "unknown"  # "ws" or "rest"
+
+
+@dataclass
+class Position:
+    """Track open position."""
+    condition_id: str
+    token_id: str
+    outcome: str  # "YES" or "NO"
+    entry_price: float
+    entry_time: float
+    size: float
+    market_name: str = ""
     
-    def __init__(self, lookback_seconds: int = 60, min_momentum: float = 0.02):
-        """
-        Args:
-            lookback_seconds: How far back to track price history
-            min_momentum: Minimum price change to trigger trade (2% default)
-        """
-        self.lookback_seconds = lookback_seconds
-        self.min_momentum = min_momentum
-        
-        # Price history: token_id -> [(timestamp, price), ...]
-        self.price_history: Dict[str, List[tuple]] = defaultdict(list)
-        
-        # Last triggered trade per token (prevent over-trading)
-        self.last_trade_time: Dict[str, float] = {}
-        self.trade_cooldown = 30  # seconds between trades on same token
-        
-    def update_price(self, token_id: str, price: float, timestamp: float = None):
-        """Update price history for a token."""
-        if timestamp is None:
-            timestamp = time.time()
-            
-        self.price_history[token_id].append((timestamp, price))
-        
-        # Clean old prices
-        cutoff = timestamp - self.lookback_seconds
-        self.price_history[token_id] = [
-            (t, p) for t, p in self.price_history[token_id] if t > cutoff
-        ]
-        
-    def get_momentum(self, token_id: str) -> Optional[float]:
-        """Calculate momentum as percentage change from earliest to latest price."""
-        history = self.price_history.get(token_id, [])
-        if len(history) < 2:
-            return None
-            
-        # Get price range
-        prices = [p for _, p in history]
-        earliest = prices[0]
-        latest = prices[-1]
-        
-        if earliest == 0:
-            return None
-            
-        momentum = (latest - earliest) / earliest
-        return momentum
+
+@dataclass
+class TradeDecision:
+    """Structured trade decision for logging."""
+    action: str  # ENTER_YES, ENTER_NO, EXIT, SKIP
+    asset: str
+    timeframe: str
+    market_title: str
+    token_id: str
+    last_price: float
+    trendiness: float
+    breakout_status: str
+    time_left_minutes: float
+    confidence: float
+    reason: str
+
+
+class TrendTracker:
+    """Track price data and compute indicators for trend-following."""
     
-    def should_trade(self, token_id: str) -> bool:
-        """Check if we should trade this token (cooldown)."""
+    def __init__(self, config: Dict):
+        self.config = config
+        
+        # Thresholds from config
+        self.min_data_seconds = config.get("TREND_MIN_DATA_SECONDS", 30)
+        self.min_history_minutes = config.get("TREND_MIN_HISTORY_MINUTES", 15)
+        self.trendiness_threshold = config.get("TREND_TRENDINESS_THRESHOLD", 0.3)
+        self.breakout_ticks = config.get("TREND_BREAKOUT_TICKS", 1)
+        self.return_threshold = config.get("TREND_RETURN_THRESHOLD", 0.005)
+        self.cooldown_minutes = config.get("TREND_COOLDOWN_MINUTES", 30)
+        self.time_left_threshold = config.get("TREND_TIME_LEFT_THRESHOLD", 12)
+        
+        # Exit thresholds
+        self.tp_ticks = config.get("TREND_TP_TICKS", 8)
+        self.sl_cents = config.get("TREND_SL_CENTS", 3)
+        self.trailing_ma_periods = config.get("TREND_TRAILING_MA_PERIODS", 20)
+        self.max_hold_minutes = config.get("TREND_MAX_HOLD_MINUTES", 45)
+        
+        # Confidence
+        self.confidence_threshold = config.get("TREND_CONFIDENCE_THRESHOLD", 0.5)
+        
+        # Price buffer: token_id -> deque of PricePoint
+        self.price_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        
+        # Last price: token_id -> (price, timestamp)
+        self.last_prices: Dict[str, tuple] = {}
+        
+        # Cooldowns: token_id -> last_trade_time
+        self.cooldowns: Dict[str, float] = {}
+        
+        # Open positions: condition_id -> Position
+        self.positions: Dict[str, Position] = {}
+        
+        # MA buffer for trailing exit: token_id -> deque of prices
+        self.ma_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        
+        # Statistics
+        self.decisions_log: List[TradeDecision] = []
+        self._lock = threading.Lock()
+    
+    def update_price(self, token_id: str, price: float, source: str = "unknown"):
+        """Update price data for a token."""
         now = time.time()
-        last_trade = self.last_trade_time.get(token_id, 0)
-        return (now - last_trade) > self.trade_cooldown
+        
+        with self._lock:
+            # Add to price buffer
+            self.price_buffers[token_id].append(PricePoint(now, price, source))
+            
+            # Update last price
+            self.last_prices[token_id] = (price, now)
+            
+            # Add to MA buffer
+            self.ma_buffers[token_id].append(price)
+    
+    def is_data_sane(self, token_id: str) -> tuple:
+        """Layer 0: Check if data is fresh enough.
+        Returns (is_sane, reason)"""
+        with self._lock:
+            buffer = self.price_buffers.get(token_id)
+            if not buffer or len(buffer) < 2:
+                return False, "INSUFFICIENT_DATA"
+            
+            # Check last update is recent (< 10 seconds)
+            last_price, last_time = self.last_prices.get(token_id, (None, 0))
+            if last_price is None:
+                return False, "NO_LAST_PRICE"
+            
+            if time.time() - last_time > 10:
+                return False, "STALE_DATA"
+            
+            # Check we have enough history (15 minutes)
+            first_point = buffer[0]
+            if time.time() - first_point.timestamp < self.min_history_minutes * 60:
+                return False, "INSUFFICIENT_HISTORY"
+            
+            return True, "OK"
+    
+    def compute_trendiness(self, token_id: str) -> float:
+        """Layer 1: Compute trendiness score.
+        trendiness = |return_10min| / sum(|step_changes|)"""
+        with self._lock:
+            buffer = list(self.price_buffers.get(token_id, []))
+            if len(buffer) < 10:
+                return 0.0
+            
+            # Get 10-minute window
+            cutoff = time.time() - 600  # 10 minutes
+            recent = [p for p in buffer if p.timestamp >= cutoff]
+            if len(recent) < 10:
+                return 0.0
+            
+            prices = [p.price for p in recent]
+            
+            # Calculate return
+            if prices[0] == 0:
+                return 0.0
+            return_10min = (prices[-1] - prices[0]) / prices[0]
+            
+            # Calculate sum of absolute changes
+            steps = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
+            total_steps = sum(steps)
+            
+            if total_steps == 0:
+                return 0.0
+            
+            trendiness = abs(return_10min) / (total_steps / prices[0])
+            return trendiness
+    
+    def compute_return_5min(self, token_id: str) -> float:
+        """Compute 5-minute return."""
+        with self._lock:
+            buffer = list(self.price_buffers.get(token_id, []))
+            if len(buffer) < 2:
+                return 0.0
+            
+            # Get 5-minute window
+            cutoff = time.time() - 300  # 5 minutes
+            recent = [p for p in buffer if p.timestamp >= cutoff]
+            if len(recent) < 2:
+                return 0.0
+            
+            prices = [p.price for p in recent]
+            if prices[0] == 0:
+                return 0.0
+            
+            return (prices[-1] - prices[0]) / prices[0]
+    
+    def get_rolling_high_low(self, token_id: str, minutes: int = 10) -> tuple:
+        """Get rolling high and low over N minutes."""
+        with self._lock:
+            buffer = list(self.price_buffers.get(token_id, []))
+            cutoff = time.time() - (minutes * 60)
+            recent = [p for p in buffer if p.timestamp >= cutoff]
+            
+            if not recent:
+                return None, None
+            
+            prices = [p.price for p in recent]
+            return max(prices), min(prices)
+    
+    def get_ma(self, token_id: str, periods: int = None) -> Optional[float]:
+        """Get moving average."""
+        if periods is None:
+            periods = self.trailing_ma_periods
+        
+        with self._lock:
+            buffer = list(self.ma_buffers.get(token_id, []))
+            if len(buffer) < periods:
+                return None
+            
+            return sum(buffer[-periods:]) / periods
+    
+    def check_cooldown(self, token_id: str) -> bool:
+        """Check if cooldown has expired."""
+        now = time.time()
+        last_trade = self.cooldowns.get(token_id, 0)
+        return (now - last_trade) > (self.cooldown_minutes * 60)
     
     def record_trade(self, token_id: str):
         """Record that we traded this token."""
-        self.last_trade_time[token_id] = time.time()
+        self.cooldowns[token_id] = time.time()
+    
+    def parse_time_left(self, market_title: str, end_date: str = None) -> Optional[float]:
+        """Parse time remaining from market title AND end_date metadata.
+        
+        Priority:
+        1. end_date metadata (ISO 8601 timestamp) - most reliable
+        2. Title parsing ("in 1 hour", etc)
+        
+        Returns minutes remaining or None if can't parse."""
+        now = time.time()
+        
+        # Priority 1: Try end_date from market metadata
+        if end_date:
+            try:
+                # Handle ISO 8601 format
+                from datetime import datetime
+                if isinstance(end_date, str):
+                    # Try parsing ISO format
+                    end_date = end_date.replace('Z', '+00:00')
+                    dt = datetime.fromisoformat(end_date)
+                    resolves_at = dt.timestamp()
+                    minutes_left = (resolves_at - now) / 60
+                    if minutes_left > 0:
+                        return minutes_left
+            except Exception:
+                pass
+        
+        # Priority 2: Parse from market title
+        if not market_title:
+            return None
+        
+        # Try to parse patterns like:
+        # "Bitcoin Up or Down - February 8, 1:30PM-"
+        # "Bitcoin Up or Down in 1 hour"
+        
+        # Pattern 1: "in X hour" or "in X hours"
+        match = re.search(r'in\s+(\d+)\s+hour', market_title, re.IGNORECASE)
+        if match:
+            return float(match.group(1)) * 60
+        
+        # Pattern 2: "in X min" or "in X minute"
+        match = re.search(r'in\s+(\d+)\s+min', market_title, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+        
+        # Pattern 3: "ends at" or "resolves at" with time
+        # Conservative: if we can't parse, return None (will be handled by confidence scoring)
+        return None
+    
+    def compute_confidence(
+        self,
+        trendiness: float,
+        breakout_magnitude: float,
+        time_left_minutes: Optional[float]
+    ) -> float:
+        """Compute confidence score (0-1).
+        confidence = trendiness * breakout_factor * time_factor"""
+        # Trendiness factor (0-1)
+        trend_factor = min(1.0, trendiness / self.trendiness_threshold)
+        
+        # Breakout magnitude factor (0-1)
+        breakout_factor = min(1.0, breakout_magnitude / (self.breakout_ticks * 2))
+        
+        # Time remaining factor
+        if time_left_minutes is None or time_left_minutes > 30:
+            time_factor = 1.0
+        else:
+            time_factor = max(0.0, time_left_minutes / self.time_left_threshold)
+        
+        confidence = trend_factor * breakout_factor * time_factor
+        return confidence
+    
+    def check_exit_conditions(
+        self,
+        position: Position,
+        current_price: float
+    ) -> tuple:
+        """Check if we should exit a position.
+        Returns (should_exit, reason, pnl_ticks)"""
+        now = time.time()
+        entry_price = position.entry_price
+        
+        # Calculate PnL in cents (assuming $1 token = 100 cents)
+        pnl_cents = (current_price - entry_price) * 100
+        pnl_ticks = pnl_cents  # 1 cent = 1 tick on $1 token
+        
+        # Check take profit (+8 ticks)
+        if pnl_ticks >= self.tp_ticks:
+            return True, f"TP:+{pnl_ticks:.1f}Ticks", pnl_ticks
+        
+        # Check stop loss (-3 cents)
+        if pnl_ticks <= -self.sl_cents:
+            return True, f"SL:{pnl_ticks:.1f}Ticks", pnl_ticks
+        
+        # Check trailing MA
+        ma = self.get_ma(position.token_id)
+        if ma is not None:
+            if position.outcome == "YES" and current_price < ma:
+                return True, f"TRAIL_MA:Price<MA", pnl_ticks
+            elif position.outcome == "NO" and current_price > ma:
+                return True, f"TRAIL_MA:Price>MA", pnl_ticks
+        
+        # Check max hold (45 minutes)
+        hold_minutes = (now - position.entry_time) / 60
+        if hold_minutes >= self.max_hold_minutes:
+            return True, f"MAX_HOLD:{hold_minutes:.0f}min", pnl_ticks
+        
+        return False, "", pnl_ticks
 
 
-class MomentumStrategy:
+class TrendStrategy:
     """
-    CLOB-based momentum trading strategy.
+    1H Trend-Following Strategy for Polymarket.
     
     Monitors real-time price changes and trades in the direction of momentum.
     """
     
-    def __init__(
-        self,
-        paper_engine=None,
-        lookback_seconds: int = 60,
-        min_momentum: float = 0.02,
-        position_size: float = 5.0,
-    ):
+    def __init__(self, paper_engine=None, config: Dict = None):
         self.paper_engine = paper_engine
-        self.tracker = MomentumTracker(lookback_seconds, min_momentum)
-        self.position_size = position_size
+        self.config = config or {}
         
-        # Track markets by token (need to know YES vs NO for each market)
+        # Initialize trend tracker
+        self.tracker = TrendTracker(self.config)
+        
+        # Track markets by token
         self.token_to_market: Dict[str, Dict] = {}
         
-        # Statistics
-        self.trades_executed = 0
-        self.signals_generated = 0
+        # Market metadata (for time-left parsing)
+        self.market_metadata: Dict[str, Dict] = {}
         
-    def _is_crypto_up_down(self, market_name: str) -> bool:
-        """Check if market is Bitcoin/Ethereum Up or Down 5min/15min (ACTIVE markets only)."""
+        # REST polling state
+        self._last_poll_time = 0
+        self._poll_interval = config.get("TREND_POLL_INTERVAL", 10) if config else 10
+        
+        # Statistics
+        self.signals_generated = 0
+        self.trades_executed = 0
+        self.decisions_log: List[TradeDecision] = []
+        
+        # Lock for thread safety
+        self._lock = threading.Lock()
+    
+    def _is_1h_crypto_up_down(self, market_name: str) -> bool:
+        """Check if market is 1H timeframe "Up or Down" crypto market.
+        
+        Filters for:
+        - Crypto (BTC, ETH, SOL, XRP)
+        - Up or Down format
+        - 1H timeframe (1h, 1 hour, 60 min, 1hr, etc.)
+        """
         if not market_name:
             return False
+        
         name_lower = market_name.lower()
         
-        # Must be crypto (Bitcoin or Ethereum)
-        is_crypto = "bitcoin" in name_lower or "btc" in name_lower or "ethereum" in name_lower or "eth" in name_lower
+        # Must be crypto
+        allowed_assets = self.config.get("TREND_ASSETS", ["BTC"])
+        is_crypto = False
+        for asset in allowed_assets:
+            if asset.lower() in name_lower or asset.lower().replace("btc", "bitcoin").replace("eth", "ethereum") in name_lower:
+                is_crypto = True
+                break
+        
         if not is_crypto:
             return False
-            
+        
         # Must be Up or Down format
-        is_up_down = "up or down" in name_lower
-        if not is_up_down:
-            return False
-            
-        # MUST have 5 min or 15 min timeframe (only active short-duration markets)
-        has_short_timeframe = "5 min" in name_lower or "15 min" in name_lower or "5min" in name_lower or "15min" in name_lower
-        if not has_short_timeframe:
+        if "up or down" not in name_lower and "up/down" not in name_lower:
             return False
         
-        return True
+        # Must have 1H timeframe indicators
+        timeframe_indicators = [
+            "1h", "1 hour", "1 hr", "60 min", "60minute",
+            "one hour", "1h ", " 1h", "hourly"
+        ]
+        has_timeframe = any(t in name_lower for t in timeframe_indicators)
         
-    def register_market(self, condition_id: str, yes_token_id: str, no_token_id: str,
-                        market_name: str = "") -> bool:
-        """Register a market with its token IDs - ONLY crypto Up/Down markets.
+        # Also accept markets that explicitly say "1 hour" or similar
+        if not has_timeframe:
+            # Check for patterns like "in 1 hour"
+            if re.search(r'in\s+1\s+hour', name_lower):
+                has_timeframe = True
+        
+        return has_timeframe
+    
+    def register_market(
+        self,
+        condition_id: str,
+        yes_token_id: str,
+        no_token_id: str,
+        market_name: str = "",
+        timeframe: str = "",
+        end_date: str = ""
+    ) -> bool:
+        """Register a market with its token IDs.
         Returns True if market was registered, False if filtered out."""
-        # Filter: Only register Bitcoin/Ethereum 5min/15min Up or Down markets
-        if not self._is_crypto_up_down(market_name):
-            return False  # Skip non-crypto or non-Up/Down markets
-            
+        
+        # Filter: Only register 1H Up/Down crypto markets
+        if not self._is_1h_crypto_up_down(market_name):
+            return False
+        
+        # Store metadata for time-left parsing
+        self.market_metadata[condition_id] = {
+            "title": market_name,
+            "end_date": end_date,
+            "timeframe": timeframe or "1h",
+        }
+        
+        # Register both YES and NO tokens
         self.token_to_market[yes_token_id] = {
             "condition_id": condition_id,
             "yes_token_id": yes_token_id,
@@ -147,133 +450,511 @@ class MomentumStrategy:
         }
         
         return True
+    
+    def on_price_update(self, token_id: str, price: float, source: str = "ws"):
+        """Handle incoming price update (from WebSocket).
         
-    def on_price_update(self, token_id: str, price: float):
-        """Handle incoming price update from CLOB."""
-        self.tracker.update_price(token_id, price)
+        Note: WS price is the last_trade_price from CLOB, which is a trade-weighted
+        price. This is appropriate for momentum signals.
+        """
+        self.tracker.update_price(token_id, price, source)
+        self._process_signals(token_id)
+    
+    def poll_prices(self, market_service, source: str = "rest"):
+        """Poll prices from REST API (fallback mode).
         
-        # Check for momentum signal
-        momentum = self.tracker.get_momentum(token_id)
-        if momentum is None:
-            return None
-            
-        self.signals_generated += 1
+        Uses MarketDataService.get_order_book() to get mid-price from order book.
+        Mid-price = (best_bid + best_ask) / 2
         
-        # Check if momentum is strong enough
-        if abs(momentum) < self.tracker.min_momentum:
-            return None
+        This ensures consistency with WS mode - both use the best available
+        price from the order book (WS uses last_trade, REST uses mid-price).
+        """
+        now = time.time()
+        
+        # Throttle polling
+        if now - self._last_poll_time < self._poll_interval:
+            return
+        
+        self._last_poll_time = now
+        
+        # Get prices for registered markets
+        for token_id, market_info in self.token_to_market.items():
+            try:
+                # Get order book to calculate mid-price
+                # We need the condition_id to fetch the order book
+                condition_id = market_info.get("condition_id")
+                if not condition_id:
+                    continue
+                
+                # Find market in current markets (need full market info)
+                # This is a limitation - in fallback mode, we need market context
+                # For now, use the yes_price/no_price from registration if available
+                if outcome == "YES":
+                    price = self.tracker.last_prices.get(token_id, (None, None))[0]
+                else:
+                    price = self.tracker.last_prices.get(token_id, (None, None))[0]
+                
+                # Fallback: try to get from market service's cached prices
+                if hasattr(market_service, 'client'):
+                    try:
+                        # Try direct token price fetch
+                        # This uses the CLOB API to get current price
+                        resp = market_service.client.get_markets(token=token_id)
+                        if resp and len(resp) > 0:
+                            price = float(resp[0].get("price", 0))
+                    except:
+                        pass
+                
+                if price and price > 0:
+                    self.tracker.update_price(token_id, price, source)
+            except Exception as e:
+                # Log but continue
+                pass  # Suppress noisy logging
+        
+        # Process signals for all tokens
+        for token_id in self.token_to_market:
+            self._process_signals(token_id)
+    
+    def _process_signals(self, token_id: str):
+        """Process signals for a token. Called after price update."""
+        with self._lock:
+            market = self.token_to_market.get(token_id)
+            if not market:
+                return
             
-        # Check cooldown
-        if not self.tracker.should_trade(token_id):
-            return None
+            # Layer 0: Data sanity check
+            is_sane, sanity_reason = self.tracker.is_data_sane(token_id)
+            if not is_sane:
+                self._log_decision(
+                    action="SKIP",
+                    token_id=token_id,
+                    market=market,
+                    reason=f"LAYER0:{sanity_reason}",
+                    trendiness=0.0,
+                    breakout="N/A",
+                    time_left=None,
+                    confidence=0.0
+                )
+                return
             
-        # Get market info
-        market = self.token_to_market.get(token_id)
-        if not market:
-            return None
+            # Get current price and time left
+            current_price, _ = self.tracker.last_prices.get(token_id, (None, None))
+            if current_price is None:
+                return
             
-        # Determine trade direction
-        if momentum > 0 and market.get("outcome") == "YES":
-            # Price going up, buy YES
-            direction = "BUY"
-            outcome = "YES"
-            signal_price = price
-        elif momentum < 0 and market.get("outcome") == "NO":
-            # Price going down, buy NO
-            direction = "BUY"
-            outcome = "NO"
-            signal_price = price
-        else:
-            return None
+            market_title = market.get("market_name", "")
+            time_left = self.tracker.parse_time_left(market_title)
             
-        # Execute paper trade
+            # Time-left gate: don't enter if < 12 minutes remain
+            if time_left is not None and time_left < self.tracker.time_left_threshold:
+                self._log_decision(
+                    action="SKIP",
+                    token_id=token_id,
+                    market=market,
+                    reason=f"TIME_LEFT:{time_left:.1f}min",
+                    trendiness=0.0,
+                    breakout="N/A",
+                    time_left=time_left,
+                    confidence=0.0
+                )
+                return
+            
+            # Layer 1: Regime filter (trendiness)
+            trendiness = self.tracker.compute_trendiness(token_id)
+            if trendiness < self.tracker.trendiness_threshold:
+                self._log_decision(
+                    action="SKIP",
+                    token_id=token_id,
+                    market=market,
+                    reason=f"LAYER1:Trendiness={trendiness:.2f}<{self.tracker.trendiness_threshold}",
+                    trendiness=trendiness,
+                    breakout="N/A",
+                    time_left=time_left,
+                    confidence=0.0
+                )
+                return
+            
+            # Layer 2: Entry trigger
+            return_5min = self.tracker.compute_return_5min(token_id)
+            rolling_high, rolling_low = self.tracker.get_rolling_high_low(token_id, minutes=10)
+            
+            if rolling_high is None or rolling_low is None:
+                return
+            
+            outcome = market.get("outcome")
+            is_breakout = False
+            breakout_direction = "NONE"
+            
+            # Determine breakout status
+            if outcome == "YES":
+                # LONG: price breaks above 10-min high
+                if current_price > rolling_high:
+                    ticks_above = (current_price - rolling_high) * 100
+                    if ticks_above >= self.tracker.breakout_ticks:
+                        is_breakout = True
+                        breakout_direction = "LONG"
+            else:
+                # SHORT: price breaks below 10-min low
+                if current_price < rolling_low:
+                    ticks_below = (rolling_low - current_price) * 100
+                    if ticks_below >= self.tracker.breakout_ticks:
+                        is_breakout = True
+                        breakout_direction = "SHORT"
+            
+            # Check entry conditions
+            can_enter = False
+            entry_action = None
+            
+            if is_breakout:
+                if outcome == "YES" and return_5min > self.tracker.return_threshold:
+                    can_enter = True
+                    entry_action = "ENTER_YES"
+                elif outcome == "NO" and return_5min < -self.tracker.return_threshold:
+                    can_enter = True
+                    entry_action = "ENTER_NO"
+            
+            # Check cooldown
+            if can_enter and not self.tracker.check_cooldown(token_id):
+                can_enter = False
+                self._log_decision(
+                    action="SKIP",
+                    token_id=token_id,
+                    market=market,
+                    reason="COOLDOWN",
+                    trendiness=trendiness,
+                    breakout=breakout_direction,
+                    time_left=time_left,
+                    confidence=0.0
+                )
+            
+            if not can_enter:
+                if is_breakout:
+                    # Breakout but wrong direction
+                    self._log_decision(
+                        action="SKIP",
+                        token_id=token_id,
+                        market=market,
+                        reason=f"RETURN_5min={return_5min:.3f}",
+                        trendiness=trendiness,
+                        breakout=breakout_direction,
+                        time_left=time_left,
+                        confidence=0.0
+                    )
+                return
+            
+            # Compute confidence
+            breakout_magnitude = abs(current_price - (rolling_high if outcome == "YES" else rolling_low)) * 100
+            confidence = self.tracker.compute_confidence(
+                trendiness, breakout_magnitude, time_left
+            )
+            
+            # Confidence threshold: do nothing when unsure
+            if confidence < self.tracker.confidence_threshold:
+                self._log_decision(
+                    action="SKIP",
+                    token_id=token_id,
+                    market=market,
+                    reason=f"CONFIDENCE={confidence:.2f}<{self.tracker.confidence_threshold}",
+                    trendiness=trendiness,
+                    breakout=breakout_direction,
+                    time_left=time_left,
+                    confidence=confidence
+                )
+                return
+            
+            # Execute entry
+            self._execute_entry(token_id, current_price, market, entry_action, confidence)
+    
+    def _execute_entry(
+        self,
+        token_id: str,
+        price: float,
+        market: Dict,
+        action: str,
+        confidence: float
+    ):
+        """Execute a paper trade entry."""
+        outcome = market.get("outcome")
+        condition_id = market.get("condition_id")
+        market_name = market.get("market_name", "Unknown")
+        
+        # Get asset from market name
+        asset = "BTC"
+        if "ethereum" in market_name.lower() or "eth" in market_name.lower():
+            asset = "ETH"
+        elif "solana" in market_name.lower() or "sol" in market_name.lower():
+            asset = "SOL"
+        elif "xrp" in market_name.lower():
+            asset = "XRP"
+        
+        # Log the decision
+        self._log_decision(
+            action=action,
+            token_id=token_id,
+            market=market,
+            reason=f"ENTRY:Conf={confidence:.2f}",
+            trendiness=self.tracker.compute_trendiness(token_id),
+            breakout="LONG" if outcome == "YES" else "SHORT",
+            time_left=self.tracker.parse_time_left(market_name),
+            confidence=confidence
+        )
+        
+        # Execute paper trade through paper_engine (so it shows on dashboard)
         if self.paper_engine:
-            result = self._execute_paper_trade(market, outcome, signal_price)
-            if result:
-                self.tracker.record_trade(token_id)
-                self.trades_executed += 1
-                return {
-                    "direction": direction,
+            try:
+                # Build signal dict in the format execute_copy_trade expects
+                signal = {
+                    "condition_id": condition_id,
+                    "token_id": token_id,
                     "outcome": outcome,
-                    "price": signal_price,
-                    "momentum": momentum,
-                    "market": market.get("market_name", ""),
+                    "whale_price": price,  # Our entry price
+                    "market_title": market_name,
+                    "score": confidence,  # Use confidence as score
+                    "source_wallet": "TREND_BOT",  # Mark as trend signal
+                    "source_username": "trend_strategy",
+                    "usdc_value": self.config.get("MOMENTUM_SIZE", 5.0),
                 }
                 
-        return None
-        
+                # Execute through paper engine
+                result = self.paper_engine.execute_copy_trade(
+                    signal,
+                    current_exposure=0.0
+                )
+                
+                if result and result.get("success"):
+                    self.tracker.record_trade(token_id)
+                    self.trades_executed += 1
+                    
+                    # Track open position for exit monitoring
+                    position = Position(
+                        condition_id=condition_id,
+                        token_id=token_id,
+                        outcome=outcome,
+                        entry_price=price,
+                        entry_time=time.time(),
+                        size=self.config.get("MOMENTUM_SIZE", 5.0),
+                        market_name=market_name
+                    )
+                    self.tracker.positions[condition_id] = position
+                    
+                    print(f"[TREND] 🎯 {action} @ ${price:.2f} "
+                          f"confidence={confidence:.2f} on {market_name[:40]}...")
+                else:
+                    reason = result.get("reason", "unknown") if result else "null_result"
+                    print(f"[TREND] ⚠️ Trade rejected: {reason} - {market_name[:40]}...")
+            except Exception as e:
+                print(f"[TREND] Trade error: {e}")
+    
     def _execute_paper_trade(self, market: Dict, outcome: str, price: float) -> Dict:
-        """Execute a paper trade through the paper engine."""
+        """Execute a paper trade through the PaperTradingEngine.
+        
+        This properly applies:
+        - Spread: Uses order book to determine fill price (not signal price)
+        - Fees: Applies fee rates based on market type (crypto vs sports/politics)
+        - Missed fills: simulate_fill returns filled=False if insufficient liquidity
+        
+        Returns dict with:
+        - success: bool
+        - reason: str (if failed)
+        - fill_price: float (actual price including spread)
+        - slippage: float
+        - fee: float
+        """
+        if not self.paper_engine:
+            print("[TREND] No paper engine - skipping trade")
+            return None
+        
         try:
-            # Get market info
             token_id = market.get("yes_token_id") if outcome == "YES" else market.get("no_token_id")
             condition_id = market.get("condition_id")
             market_name = market.get("market_name", "Unknown")
-            momentum = self.tracker.get_momentum(token_id)
             
-            if self.paper_engine:
-                # Try to use paper engine's method
-                try:
-                    # Get current order book from CLOB
-                    if hasattr(self, '_clob_orderbook'):
-                        book = self._clob_orderbook.get_order_book_snapshot(token_id)
-                        if book:
-                            # Try to fill
-                            print(f"[MOMENTUM] 🎯 Signal: {outcome} @ ${price:.2f} "
-                                  f"momentum={momentum:.1%} on {market_name[:30]}... (book available)")
-                            # For now, just log - full execution needs more integration
-                            return {"signal": True, "outcome": outcome, "price": price}
-                except Exception as e:
-                    pass
+            # Get order book for this market to simulate realistic fill
+            # This is critical for spread/slippage simulation
+            book = None
+            if hasattr(self, '_clob_orderbook'):
+                # Try to get from CLOB WebSocket cache first
+                book_snapshot = self._clob_orderbook.get_order_book_snapshot(token_id, depth=10)
+                if book_snapshot and book_snapshot.get("asks") and book_snapshot.get("bids"):
+                    book = {
+                        "asks_yes": book_snapshot.get("asks", []),
+                        "bids_yes": book_snapshot.get("bids", []),
+                    }
             
-            # Log the signal (main functionality working)
-            print(f"[MOMENTUM] 🎯 Signal: {outcome} @ ${price:.2f} "
-                  f"momentum={momentum:.1%} on {market_name[:30]}...")
+            # If no CLOB book, we can't properly simulate - log warning
+            if not book:
+                print(f"[TREND] ⚠️ No order book for {token_id[:12]}... - cannot simulate fill accurately")
+                # Return None to skip - we need book for realistic fills
+                return None
             
-            return {"signal": True, "outcome": outcome, "price": price}
+            # Get fee rate based on market type
+            yes_fee_bps = 100 if "bitcoin" in market_name.lower() or "ethereum" in market_name.lower() else 0
+            
+            # Use the paper engine's simulation
+            from src.paper_fills import simulate_fill
+            
+            size = self.config.get("MOMENTUM_SIZE", 5.0)
+            
+            # Get the appropriate order book side for our outcome
+            if outcome == "YES":
+                order_book_side = book.get("asks_yes", [])
+            else:
+                order_book_side = book.get("asks_no", [])
+            
+            if not order_book_side:
+                print(f"[TREND] ⚠️ No liquidity for {outcome} on {token_id[:12]}...")
+                return {"success": False, "reason": "NO_LIQUIDITY"}
+            
+            # Simulate fill against order book (this applies spread/slippage)
+            fill_result = simulate_fill(order_book_side, size)
+            
+            if not fill_result["filled"]:
+                print(f"[TREND] ⚠️ Missed fill for {token_id[:12]}... - insufficient order book depth")
+                return {"success": False, "reason": "MISSED_FILL", "slippage": 0}
+            
+            # Calculate fee
+            from src.paper_fees import calculate_trading_fee
+            fee = calculate_trading_fee(fill_result["fill_price"], fill_result["fill_size"], yes_fee_bps)
+            
+            print(f"[TREND] 📝 Paper Trade: {outcome} @ signal=${price:.3f} -> fill=${fill_result['fill_price']:.3f} "
+                  f"(spread=${abs(fill_result['fill_price']-price):.4f}) fee=${fee:.4f}")
+            
+            # Return success - actual position recording happens in paper_engine
+            return {
+                "success": True,
+                "outcome": outcome,
+                "price": price,
+                "fill_price": fill_result["fill_price"],
+                "slippage": fill_result["slippage"],
+                "fee": fee,
+                "size": fill_result["fill_size"],
+            }
             
         except Exception as e:
-            print(f"[MOMENTUM] Trade error: {e}")
+            print(f"[TREND] Paper trade error: {e}")
             return None
+    
+    def check_exits(self):
+        """Check exit conditions for all open positions.
+        Called periodically from main loop."""
+        for condition_id, position in list(self.tracker.positions.items()):
+            current_price, _ = self.tracker.last_prices.get(position.token_id, (None, None))
+            if current_price is None:
+                continue
             
+            should_exit, reason, pnl = self.tracker.check_exit_conditions(position, current_price)
+            
+            if should_exit:
+                self._execute_exit(position, current_price, reason, pnl)
+    
+    def _execute_exit(
+        self,
+        position: Position,
+        current_price: float,
+        reason: str,
+        pnl_ticks: float
+    ):
+        """Execute a paper trade exit through paper_engine."""
+        
+        # Use paper_engine to close position (records in trade_history)
+        if self.paper_engine:
+            try:
+                signal = {
+                    "condition_id": position.condition_id,
+                    "token_id": position.token_id,
+                    "outcome": position.outcome,
+                    "whale_price": current_price,  # Exit price
+                    "market_title": position.market_name,
+                    "source_username": "trend_strategy",
+                    "exit_reason": reason,
+                }
+                
+                result = self.paper_engine.close_copy_position(signal, risk_guard=None)
+                
+                if result and result.get("success"):
+                    print(f"[TREND] ✅ Exit recorded in paper_engine")
+                else:
+                    print(f"[TREND] ⚠️ Exit not recorded: {result.get('reason', 'unknown') if result else 'null'}")
+            except Exception as e:
+                print(f"[TREND] Exit error: {e}")
+        
+        # Log the exit
+        self._log_decision(
+            action="EXIT",
+            token_id=position.token_id,
+            market={
+                "condition_id": position.condition_id,
+                "market_name": position.market_name,
+                "outcome": position.outcome
+            },
+            reason=f"{reason}:PnL={pnl_ticks:.1f}Ticks",
+            trendiness=0.0,
+            breakout="N/A",
+            time_left=None,
+            confidence=1.0
+        )
+        
+        # Remove position from tracker
+        del self.tracker.positions[position.condition_id]
+        
+        print(f"[TREND] 🏁 EXIT {position.outcome} @ ${current_price:.2f} "
+              f"{reason} PnL={pnl_ticks:.1f} ticks on {position.market_name[:40]}...")
+    
+    def _log_decision(
+        self,
+        action: str,
+        token_id: str,
+        market: Dict,
+        reason: str,
+        trendiness: float,
+        breakout: str,
+        time_left: Optional[float],
+        confidence: float
+    ):
+        """Log a trade decision for observability."""
+        # Get asset
+        market_name = market.get("market_name", "")
+        asset = "BTC"
+        if "ethereum" in market_name.lower() or "eth" in market_name.lower():
+            asset = "ETH"
+        elif "solana" in market_name.lower() or "sol" in market_name.lower():
+            asset = "SOL"
+        elif "xrp" in market_name.lower():
+            asset = "XRP"
+        
+        # Get price
+        price, _ = self.tracker.last_prices.get(token_id, (0.0, 0.0))
+        
+        decision = TradeDecision(
+            action=action,
+            asset=asset,
+            timeframe="1H",
+            market_title=market_name,
+            token_id=token_id,
+            last_price=price,
+            trendiness=trendiness,
+            breakout_status=breakout,
+            time_left_minutes=time_left or -1.0,
+            confidence=confidence,
+            reason=reason
+        )
+        
+        self.decisions_log.append(decision)
+        
+        # Also log to console for now
+        print(f"[TREND] {action} | {asset} | 1H | {market_name[:30]}... | "
+              f"price=${price:.2f} | trend={trendiness:.2f} | breakout={breakout} | "
+              f"time_left={time_left:.1f}min | conf={confidence:.2f} | {reason}")
+    
     def get_stats(self) -> Dict:
         """Get strategy statistics."""
         return {
             "signals_generated": self.signals_generated,
             "trades_executed": self.trades_executed,
-            "conversion_rate": self.trades_executed / max(1, self.signals_generated),
+            "decisions_logged": len(self.decisions_log),
+            "open_positions": len(self.tracker.positions),
         }
 
 
-# Standalone test
-if __name__ == "__main__":
-    strategy = MomentumStrategy(
-        lookback_seconds=30,
-        min_momentum=0.03,
-        position_size=5.0,
-    )
-    
-    # Register test market
-    strategy.register_market(
-        "test_btc_up",
-        "0x123...yes",
-        "0x123...no",
-        "Bitcoin Up or Down - Test"
-    )
-    
-    # Simulate price updates
-    import random
-    price = 0.50
-    
-    for i in range(20):
-        # Simulate upward momentum
-        price += random.uniform(-0.01, 0.02)
-        price = max(0.01, min(0.99, price))
-        
-        result = strategy.on_price_update("0x123...yes", price)
-        if result:
-            print(f"Trade executed: {result}")
-            
-        time.sleep(0.5)
-        
-    print(f"\nStats: {strategy.get_stats()}")
+# Backward compatibility alias
+MomentumStrategy = TrendStrategy

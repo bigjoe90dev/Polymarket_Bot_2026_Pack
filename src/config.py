@@ -117,6 +117,50 @@ def load_or_create_config():
         print("    - Execution controls: Max 5% price chase limit vs whale entry")
         print("    - Fee classification: Crypto 10%, sports/politics 0%, fallback 2%")
 
+    # v15: Phase 1 - 1H Trend-Following Bot
+    if config.get("_config_version", 0) < 15:
+        config["_config_version"] = 15
+        # Phase 1: 1H Trend-Following Strategy
+        config["TREND_TIMEFRAME"] = "1h"                    # 1H only for Phase 1
+        config["TREND_ASSETS"] = ["BTC"]                     # BTC only initially
+        config["TREND_USE_WS"] = True                        # WebSocket primary
+        config["TREND_WS_RECONNECT_DELAY"] = 5               # seconds
+        config["TREND_WS_HEALTHY_THRESHOLD"] = 60            # seconds before switching back
+        config["TREND_POLL_INTERVAL"] = 10                    # seconds (fallback mode)
+        
+        # Signal Thresholds
+        config["TREND_MIN_DATA_SECONDS"] = 30                 # Layer 0: min updates
+        config["TREND_MIN_HISTORY_MINUTES"] = 15               # Layer 0: buffer history
+        config["TREND_TRENDINESS_THRESHOLD"] = 0.3            # Layer 1: regime filter
+        config["TREND_BREAKOUT_TICKS"] = 1                    # Layer 2: breakout
+        config["TREND_RETURN_THRESHOLD"] = 0.005              # Layer 2: 5-min return (0.5%)
+        config["TREND_COOLDOWN_MINUTES"] = 30                  # Layer 2: cooldown
+        
+        # Time-Left Gate
+        config["TREND_TIME_LEFT_THRESHOLD"] = 12               # minutes remaining
+        
+        # Exit Rules
+        config["TREND_TP_TICKS"] = 8                          # take profit
+        config["TREND_SL_CENTS"] = 3                          # stop loss ($0.03)
+        config["TREND_TRAILING_MA_PERIODS"] = 20              # trailing MA periods
+        config["TREND_TRAILING_SAMPLE_SEC"] = 5               # MA sampling interval
+        config["TREND_MAX_HOLD_MINUTES"] = 45                 # max hold time
+        
+        # Confidence
+        config["TREND_CONFIDENCE_THRESHOLD"] = 0.5            # min confidence to act
+        
+        # Risk (paper mode - no hard stop)
+        config["TREND_MAX_CONCURRENT"] = 1                    # 1 position per asset
+        config["TREND_DAILY_DRAWDOWN_WARN"] = 20              # $20 warning (log only)
+        
+        dirty = True
+        print("[*] Config v15 — PHASE 1: 1H TREND-FOLLOWING BOT")
+        print("    - Timeframe: 1H only")
+        print("    - Assets: BTC only (configurable)")
+        print("    - Signal: 3-layer gating (data sanity, regime, entry)")
+        print("    - Exit: TP +8 ticks, SL -3 cents, trailing MA, 45min max")
+        print("    - Confidence scoring: do nothing when unsure")
+
     # Select mode FIRST so we know whether credentials are needed
     if "MODE" not in config:
         print("\nSelect Mode:")
