@@ -52,6 +52,7 @@ class MarketDataService:
                     "yes_price": yes_token.get("price", 0),
                     "no_price": no_token.get("price", 0),
                     "title": m.get("question", ""),  # For fee classification
+                    "end_date": m.get("endDate") or m.get("end_date"),
                 })
 
         return all_markets

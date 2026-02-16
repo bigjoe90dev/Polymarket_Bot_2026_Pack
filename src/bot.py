@@ -137,10 +137,12 @@ class TradingBot:
                 no_token = m.get("no_token_id")
                 condition_id = m.get("condition_id", "")
                 title = m.get("title", "")
+                # Get end_date from market metadata if available
+                end_date = m.get("end_date") or m.get("endDate") or m.get("end_date_iso")
                 
                 if yes_token and no_token:
                     was_registered = self.momentum_strategy.register_market(
-                        condition_id, yes_token, no_token, title
+                        condition_id, yes_token, no_token, title, end_date=end_date
                     )
                     if was_registered:
                         registered_count += 1

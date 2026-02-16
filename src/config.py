@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 CONFIG_PATH = "config/config.json"
-CONFIG_VERSION = 14  # v14: Production hardening (metrics, parity, health monitoring, backup rotation)
+CONFIG_VERSION = 16  # v16: Backtest mode for 1H trend-following
 
 
 def load_or_create_config():
@@ -160,6 +160,27 @@ def load_or_create_config():
         print("    - Signal: 3-layer gating (data sanity, regime, entry)")
         print("    - Exit: TP +8 ticks, SL -3 cents, trailing MA, 45min max")
         print("    - Confidence scoring: do nothing when unsure")
+
+    # v16: Backtest Mode Parameters
+    if config.get("_config_version", 0) < 16:
+        config["_config_version"] = 16
+        # Backtest settings
+        config["BACKTEST_LOOKBACK_DAYS"] = 365              # Days of history to fetch
+        config["BACKTEST_TEST_SPLIT"] = 0.2                 # 20% for test, 80% for train
+        config["BACKTEST_CLEAR_CACHE"] = False              # Force refresh cached data
+        config["BACKTEST_RANDOM_SEED"] = 42                 # For deterministic missed fills
+        config["BACKTEST_COST_PER_SIDE_CENTS"] = 2         # Spread penalty per side (entry + exit)
+        config["BACKTEST_MISSED_FILL_PROBABILITY"] = 0.15   # 15% of entries missed
+        config["BACKTEST_FEE_BPS"] = 0                      # Fee in basis points (0 = use API if available)
+        config["BACKTEST_LOCKED_PARAMS"] = True             # Prevent parameter optimization
+        config["BACKTEST_INITIAL_BALANCE"] = 100.0          # Starting balance for backtest
+        dirty = True
+        print("[*] Config v16 — BACKTEST MODE PARAMETERS")
+        print("    - Lookback days: 365")
+        print("    - Test split: 20%")
+        print("    - Cost per side: 2 cents")
+        print("    - Missed fill probability: 15%")
+        print("    - Fee BPS: 0 (configurable)")
 
     # Select mode FIRST so we know whether credentials are needed
     if "MODE" not in config:

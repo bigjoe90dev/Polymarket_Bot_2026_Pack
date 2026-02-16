@@ -59,6 +59,8 @@ class TradeDecision:
     time_left_minutes: float
     confidence: float
     reason: str
+    time_left_source: str = "none"  # "metadata", "title_fallback", or "none"
+    tick_size: float = 0.01  # Tick size in dollars (default $0.01 for Polymarket)
 
 
 class TrendTracker:
@@ -226,53 +228,48 @@ class TrendTracker:
         """Record that we traded this token."""
         self.cooldowns[token_id] = time.time()
     
-    def parse_time_left(self, market_title: str, end_date: str = None) -> Optional[float]:
+    def parse_time_left(self, market_title: str, end_date: str = None) -> tuple:
         """Parse time remaining from market title AND end_date metadata.
         
         Priority:
         1. end_date metadata (ISO 8601 timestamp) - most reliable
         2. Title parsing ("in 1 hour", etc)
         
-        Returns minutes remaining or None if can't parse."""
+        Returns (minutes_remaining, source) where:
+        - minutes_remaining: float or None
+        - source: "metadata" or "title_fallback" or "none"
+        """
         now = time.time()
         
-        # Priority 1: Try end_date from market metadata
+        # Priority 1: Try end_date from market metadata (MOST RELIABLE)
         if end_date:
             try:
-                # Handle ISO 8601 format
                 from datetime import datetime
                 if isinstance(end_date, str):
-                    # Try parsing ISO format
                     end_date = end_date.replace('Z', '+00:00')
                     dt = datetime.fromisoformat(end_date)
                     resolves_at = dt.timestamp()
                     minutes_left = (resolves_at - now) / 60
                     if minutes_left > 0:
-                        return minutes_left
+                        return minutes_left, "metadata"
             except Exception:
                 pass
         
         # Priority 2: Parse from market title
         if not market_title:
-            return None
-        
-        # Try to parse patterns like:
-        # "Bitcoin Up or Down - February 8, 1:30PM-"
-        # "Bitcoin Up or Down in 1 hour"
+            return None, "none"
         
         # Pattern 1: "in X hour" or "in X hours"
         match = re.search(r'in\s+(\d+)\s+hour', market_title, re.IGNORECASE)
         if match:
-            return float(match.group(1)) * 60
+            return float(match.group(1)) * 60, "title_fallback"
         
         # Pattern 2: "in X min" or "in X minute"
         match = re.search(r'in\s+(\d+)\s+min', market_title, re.IGNORECASE)
         if match:
-            return float(match.group(1))
+            return float(match.group(1)), "title_fallback"
         
-        # Pattern 3: "ends at" or "resolves at" with time
-        # Conservative: if we can't parse, return None (will be handled by confidence scoring)
-        return None
+        return None, "none"
     
     def compute_confidence(
         self,
@@ -416,8 +413,8 @@ class TrendStrategy:
         yes_token_id: str,
         no_token_id: str,
         market_name: str = "",
-        timeframe: str = "",
-        end_date: str = ""
+        end_date: str = None,
+        timeframe: str = ""
     ) -> bool:
         """Register a market with its token IDs.
         Returns True if market was registered, False if filtered out."""
@@ -426,10 +423,10 @@ class TrendStrategy:
         if not self._is_1h_crypto_up_down(market_name):
             return False
         
-        # Store metadata for time-left parsing
+        # Store metadata for time-left parsing (includes end_date!)
         self.market_metadata[condition_id] = {
             "title": market_name,
-            "end_date": end_date,
+            "end_date": end_date,  # THIS IS CRITICAL FOR TIME-LEFT GATE
             "timeframe": timeframe or "1h",
         }
         
@@ -543,7 +540,15 @@ class TrendStrategy:
                 return
             
             market_title = market.get("market_name", "")
-            time_left = self.tracker.parse_time_left(market_title)
+            condition_id = market.get("condition_id", "")
+            
+            # Get end_date from stored market metadata (if available)
+            end_date = None
+            if condition_id and condition_id in self.market_metadata:
+                end_date = self.market_metadata[condition_id].get("end_date")
+            
+            # Parse time left with end_date from metadata
+            time_left, time_left_source = self.tracker.parse_time_left(market_title, end_date)
             
             # Time-left gate: don't enter if < 12 minutes remain
             if time_left is not None and time_left < self.tracker.time_left_threshold:
@@ -551,11 +556,12 @@ class TrendStrategy:
                     action="SKIP",
                     token_id=token_id,
                     market=market,
-                    reason=f"TIME_LEFT:{time_left:.1f}min",
+                    reason=f"TIME_LEFT:{time_left:.1f}min[{time_left_source}]",
                     trendiness=0.0,
                     breakout="N/A",
                     time_left=time_left,
-                    confidence=0.0
+                    confidence=0.0,
+                    time_left_source=time_left_source
                 )
                 return
             
@@ -687,6 +693,12 @@ class TrendStrategy:
         elif "xrp" in market_name.lower():
             asset = "XRP"
         
+        # Get time_left with metadata
+        end_date = None
+        if condition_id and condition_id in self.market_metadata:
+            end_date = self.market_metadata[condition_id].get("end_date")
+        time_left, time_left_source = self.tracker.parse_time_left(market_name, end_date)
+        
         # Log the decision
         self._log_decision(
             action=action,
@@ -695,8 +707,9 @@ class TrendStrategy:
             reason=f"ENTRY:Conf={confidence:.2f}",
             trendiness=self.tracker.compute_trendiness(token_id),
             breakout="LONG" if outcome == "YES" else "SHORT",
-            time_left=self.tracker.parse_time_left(market_name),
-            confidence=confidence
+            time_left=time_left,
+            confidence=confidence,
+            time_left_source=time_left_source
         )
         
         # Execute paper trade through paper_engine (so it shows on dashboard)
@@ -909,7 +922,8 @@ class TrendStrategy:
         trendiness: float,
         breakout: str,
         time_left: Optional[float],
-        confidence: float
+        confidence: float,
+        time_left_source: str = "none"
     ):
         """Log a trade decision for observability."""
         # Get asset
@@ -925,6 +939,9 @@ class TrendStrategy:
         # Get price
         price, _ = self.tracker.last_prices.get(token_id, (0.0, 0.0))
         
+        # Verify tick size from price history (inferred from smallest non-zero delta)
+        tick_size = self._verify_tick_size(token_id)
+        
         decision = TradeDecision(
             action=action,
             asset=asset,
@@ -936,15 +953,54 @@ class TrendStrategy:
             breakout_status=breakout,
             time_left_minutes=time_left or -1.0,
             confidence=confidence,
-            reason=reason
+            reason=reason,
+            time_left_source=time_left_source,
+            tick_size=tick_size
         )
         
         self.decisions_log.append(decision)
         
-        # Also log to console for now
+        # Also log to console
         print(f"[TREND] {action} | {asset} | 1H | {market_name[:30]}... | "
               f"price=${price:.2f} | trend={trendiness:.2f} | breakout={breakout} | "
-              f"time_left={time_left:.1f}min | conf={confidence:.2f} | {reason}")
+              f"time_left={time_left:.1f}min[{time_left_source}] | conf={confidence:.2f} | "
+              f"tick=${tick_size:.4f} | {reason}")
+    
+    def _verify_tick_size(self, token_id: str) -> float:
+        """Verify tick size from observed price deltas.
+        
+        Polymarket 1H Up/Down crypto markets typically trade in $0.01 (1 cent) ticks.
+        This method infers tick size from the smallest observed price delta.
+        
+        Returns: tick_size in dollars (default 0.01)
+        """
+        DEFAULT_TICK = 0.01
+        
+        buffer = list(self.tracker.price_buffers.get(token_id, []))
+        if len(buffer) < 10:
+            return DEFAULT_TICK
+        
+        # Get prices in order
+        prices = [p.price for p in buffer]
+        if len(prices) < 2:
+            return DEFAULT_TICK
+        
+        # Calculate all deltas
+        deltas = sorted(set(abs(prices[i] - prices[i-1]) for i in range(1, len(prices))))
+        
+        if not deltas:
+            return DEFAULT_TICK
+        
+        # Smallest non-zero delta is our inferred tick size
+        smallest_delta = deltas[0]
+        
+        # Verify it's close to expected tick size ($0.01)
+        if abs(smallest_delta - DEFAULT_TICK) > 0.005:
+            # Tick size is NOT $0.01 - log warning but use observed
+            print(f"[TREND] ⚠️ Unusual tick size: observed={smallest_delta:.4f}, expected={DEFAULT_TICK}")
+            return smallest_delta
+        
+        return DEFAULT_TICK
     
     def get_stats(self) -> Dict:
         """Get strategy statistics."""
