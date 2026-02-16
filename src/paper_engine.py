@@ -181,7 +181,8 @@ class PaperTradingEngine:
 
             # Record fills
             now = time.time()
-            market_name = market_info.get("condition_id", condition_id)[:30]
+            # Use market title (question) if available, otherwise fall back to truncated condition_id
+            market_name = market_info.get("title") or market_info.get("condition_id", condition_id)[:30]
 
             yes_fill_entry = {
                 "fill_id": str(uuid.uuid4())[:8],
@@ -466,10 +467,19 @@ class PaperTradingEngine:
                             "reason": f"Winner's curse: {deviation:.1%} deviation "
                                       f"(cap {max_dev:.0%})"}
 
+            # v14: Execution Quality Control - Don't chase beyond max limit
+            # This prevents trading when price has moved significantly from whale's entry
+            max_chase_pct = self.config.get("MAX_PRICE_CHASE_PCT", 0.05)  # 5% default
+            if whale_price > 0 and our_price > whale_price * (1 + max_chase_pct):
+                return {"success": False,
+                        "reason": f"Price chase limit: our_price {our_price:.3f} > "
+                                  f"whale {whale_price:.3f} + {max_chase_pct:.1%}"}
+
             shares = copy_budget / our_price
 
             # Fee lookup (use curved Polymarket formula)
-            fee_bps = self._get_fee_rate(token_id)
+            # v14: Pass market context for accurate classification
+            fee_bps = self._get_fee_rate(token_id, market_title, condition_id)
             fee = calculate_trading_fee(our_price, shares, fee_bps)
             total_cost = copy_budget + fee + gas_fee
 
@@ -590,7 +600,9 @@ class PaperTradingEngine:
                 return {"success": False, "reason": "Not a copy position"}
 
             # ── STRESS: Full friction on sell side ──
-            signal_age = time.time() - signal.get("detected_at", time.time())
+            # v14 FIX: Use whale's actual exit time, not our detection time
+            whale_exit_time = signal.get("timestamp", signal.get("detected_at", time.time()))
+            signal_age = time.time() - whale_exit_time
             exit_stress = self.stress.stress_exit(
                 whale_price=whale_price,
                 condition_id=condition_id,
@@ -684,17 +696,19 @@ class PaperTradingEngine:
                 "fees": round(fee, 4),
             }
 
-    def _get_fee_rate(self, token_id):
-        """Get fee rate in bps for a token. Returns conservative default on failure."""
+    def _get_fee_rate(self, token_id, market_title="", condition_id=""):
+        """Get fee rate in bps for a token. Returns conservative default on failure.
+
+        v14 ENHANCEMENT: Now uses market classification fallback for accuracy.
+        """
         if not self.market_client or not token_id:
             return DEFAULT_FEE_BPS  # Conservative fallback
         try:
-            rate = self.market_client.get_fee_rate_bps(token_id)
-            if rate <= 0:
-                return DEFAULT_FEE_BPS  # API returned 0 — use conservative default
+            # v14: Pass market_title and condition_id for classification fallback
+            rate = self.market_client.get_fee_rate_bps(token_id, market_title, condition_id)
             return rate
         except Exception as e:
-            log_decision("FEE_WARN", f"Fee lookup failed for {token_id[:12]}: {e}")
+            log_decision("FEE_WARN", f"Fee lookup failed for {token_id[:12] if token_id else '?'}: {e}")
             return DEFAULT_FEE_BPS  # Conservative fallback
 
     # ── Auto Sell (Take-Profit / Stop-Loss) ─────────────────────
@@ -709,11 +723,16 @@ class PaperTradingEngine:
         outcome = pos.get("outcome", "")
         market_title = pos.get("market_name", "")
 
+        # v14: Use time since price update as staleness (conservative)
+        # We're not following a whale exit, so price age is the relevant metric
+        price_updated_at = pos.get("price_updated_at", time.time())
+        signal_age = time.time() - price_updated_at
+
         # Stress on the sell
         exit_stress = self.stress.stress_exit(
             whale_price=current_price,
             condition_id=condition_id,
-            signal_age_sec=0,
+            signal_age_sec=signal_age,
         )
         if not exit_stress["success"]:
             return  # Stress blocked the sell — try again next cycle

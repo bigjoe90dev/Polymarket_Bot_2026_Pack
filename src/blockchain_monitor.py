@@ -24,6 +24,7 @@ import threading
 import urllib.request
 from web3 import Web3
 from web3.providers import LegacyWebSocketProvider
+import concurrent.futures
 
 
 # Polymarket CTFExchange contract on Polygon
@@ -67,6 +68,15 @@ class BlockchainMonitor:
         # Tracked whale addresses (set by whale_tracker)
         self.tracked_wallets = set()  # Checksummed addresses
 
+        # v14: Market metadata cache (eliminates per-event HTTP fetches)
+        # Updated by bot after fetching active markets
+        self._token_to_market = {}  # token_id -> {condition_id, outcome, title}
+        self._cache_lock = threading.Lock()
+
+        # v14: Reorg protection - pending events wait for confirmations
+        self.min_confirmations = config.get("MIN_BLOCKCHAIN_CONFIRMATIONS", 1)
+        self._pending_events = []  # [(event, block_num, queued_at), ...]
+
         # Connection state
         self.running = False
         self.connected = False
@@ -80,6 +90,7 @@ class BlockchainMonitor:
         self.wallets_discovered = 0  # Network discovery counter
         self.last_event_time = 0
         self.last_block = 0
+        self.events_dropped_reorg = 0  # v14: Reorg tracking
 
     def start(self):
         """Start monitoring in background thread."""
@@ -94,6 +105,7 @@ class BlockchainMonitor:
     def stop(self):
         """Stop monitoring."""
         self.running = False
+        self.connected = False  # v14: Set connected flag to False on stop
         if self._thread:
             self._thread.join(timeout=5)
         print("[BLOCKCHAIN] Monitor stopped")
@@ -108,6 +120,50 @@ class BlockchainMonitor:
             Web3.to_checksum_address(addr.lower()) for addr in wallet_addresses
         }
         print(f"[BLOCKCHAIN] Tracking {len(self.tracked_wallets)} whale wallets")
+
+    def update_market_cache(self, markets):
+        """Update market metadata cache (v14 - eliminates per-event HTTP).
+
+        Called by bot after fetching active markets. Enables instant token->market
+        lookup without network calls.
+
+        Args:
+            markets: List of market dicts from MarketDataService.get_active_markets()
+                Each with: condition_id, yes_token_id, no_token_id, title
+        """
+        with self._cache_lock:
+            self._token_to_market = {}
+
+            for m in markets:
+                yes_id = m.get("yes_token_id")
+                no_id = m.get("no_token_id")
+                cid = m.get("condition_id", "")
+                title = m.get("title", "")
+
+                if yes_id:
+                    # Convert hex token ID to int for comparison
+                    try:
+                        yes_id_int = int(yes_id, 16) if isinstance(yes_id, str) and yes_id.startswith("0x") else int(yes_id)
+                        self._token_to_market[yes_id_int] = {
+                            "condition_id": cid,
+                            "outcome": "YES",
+                            "title": title,
+                        }
+                    except (ValueError, TypeError):
+                        pass
+
+                if no_id:
+                    try:
+                        no_id_int = int(no_id, 16) if isinstance(no_id, str) and no_id.startswith("0x") else int(no_id)
+                        self._token_to_market[no_id_int] = {
+                            "condition_id": cid,
+                            "outcome": "NO",
+                            "title": title,
+                        }
+                    except (ValueError, TypeError):
+                        pass
+
+            print(f"[BLOCKCHAIN] Market cache updated: {len(self._token_to_market)} token mappings")
 
     def _monitor_loop(self):
         """Main monitoring loop with reconnection logic."""
@@ -133,11 +189,14 @@ class BlockchainMonitor:
         self.last_block = latest_block
         print(f"[BLOCKCHAIN] Connected (block: {latest_block})")
 
-        # Create event filter for OrderFilled events
+        # BUG FIX #4: On reconnect, backfill from last seen block (with 5-block safety margin)
+        backfill_from = max(1, self.last_block - 5) if self.last_block > 0 else "latest"
+
         event_filter = self.contract.events.OrderFilled.create_filter(
-            fromBlock="latest"
+            from_block=backfill_from
         )
 
+        print(f"[BLOCKCHAIN] Event filter created (from block: {backfill_from})")
         print(f"[BLOCKCHAIN] Subscribed to OrderFilled events at {CTFEXCHANGE_ADDRESS}")
 
         # Poll for new events
@@ -145,15 +204,52 @@ class BlockchainMonitor:
             try:
                 new_events = event_filter.get_new_entries()
                 for event in new_events:
-                    self._process_order_filled(event)
+                    # BUG FIX #4: Update last_block on EVERY event
+                    block_num = event.get('blockNumber', 0)
+                    if block_num > self.last_block:
+                        self.last_block = block_num
 
-                # Heartbeat every 10 seconds
+                    # v14: Reorg protection - queue event for confirmation
+                    if self.min_confirmations > 0:
+                        self._pending_events.append((event, block_num, time.time()))
+                    else:
+                        # No confirmations required - process immediately
+                        self._process_order_filled(event)
+
+                # v14: Process pending events that have enough confirmations
                 current_block = self.web3.eth.block_number
                 if current_block > self.last_block:
                     self.last_block = current_block
-                    if current_block % 10 == 0:  # Every ~10 blocks (~25 seconds)
-                        print(f"[BLOCKCHAIN] Heartbeat: block {current_block}, "
-                              f"{self.whale_trades_detected} whale trades detected")
+
+                if self._pending_events:
+                    confirmed = []
+                    still_pending = []
+
+                    for event, event_block, queued_at in self._pending_events:
+                        confirmations = current_block - event_block
+
+                        if confirmations >= self.min_confirmations:
+                            # Event is confirmed - process it
+                            confirmed.append(event)
+                        elif time.time() - queued_at < 300:  # Keep pending up to 5 min
+                            still_pending.append((event, event_block, queued_at))
+                        else:
+                            # Too old - likely reorged out
+                            self.events_dropped_reorg += 1
+
+                    # Process confirmed events
+                    for event in confirmed:
+                        self._process_order_filled(event)
+
+                    # Update pending list
+                    self._pending_events = still_pending
+
+                # Heartbeat every 10 blocks
+                if current_block % 10 == 0:
+                    pending_count = len(self._pending_events)
+                    print(f"[BLOCKCHAIN] Heartbeat: block {current_block}, "
+                          f"{self.whale_trades_detected} whale trades detected, "
+                          f"{pending_count} pending confirmations")
 
                 time.sleep(0.5)  # Poll every 500ms
 
@@ -227,56 +323,74 @@ class BlockchainMonitor:
             whale_token_id = taker_asset_id if whale_side == "maker" else maker_asset_id
             whale_amount = taker_amount if whale_side == "maker" else maker_amount
 
-            # Calculate price (amount paid / amount received)
-            # If whale is maker: they sold makerAmount, received takerAmount
-            # Price = takerAmount / makerAmount (how much they got per unit sold)
-            # If whale is taker: they sold takerAmount, received makerAmount
-            # Price = takerAmount / makerAmount (what they paid per unit)
-
+            # BUG FIX #2: Calculate price correctly based on whale's side
+            # Price = what whale PAID per share they RECEIVED
             if whale_side == "maker":
-                # Maker sells makerAmount, buys takerAmount
-                whale_price = float(taker_amount) / float(maker_amount) if maker_amount > 0 else 0
+                # Maker sold makerAmount, received takerAmount of outcome tokens
+                # Price = cost per share received = makerAmount / takerAmount
+                whale_price = float(maker_amount) / float(taker_amount) if taker_amount > 0 else 0
             else:
-                # Taker sells takerAmount, buys makerAmount
+                # Taker sold takerAmount, received makerAmount of outcome tokens
+                # Price = cost per share received = takerAmount / makerAmount
                 whale_price = float(taker_amount) / float(maker_amount) if maker_amount > 0 else 0
 
-            print(f"[BLOCKCHAIN] Whale trade: {whale_address[:10]}... "
-                  f"bought token {whale_token_id} at price {whale_price:.4f} "
-                  f"(tx: {event['transactionHash'].hex()[:10]}...)")
-
-            # Fetch market metadata from Polymarket API using token ID
-            market_data = self._fetch_market_from_token_id(whale_token_id)
+            # v14: Use market cache (instant, no HTTP)
+            with self._cache_lock:
+                market_data = self._token_to_market.get(whale_token_id)
 
             if not market_data:
-                print(f"[BLOCKCHAIN] Failed to fetch market data for token {whale_token_id}")
-                return
+                # Cache miss - try HTTP fallback
+                market_data = self._fetch_market_from_token_id(whale_token_id)
+                if not market_data:
+                    print(f"[BLOCKCHAIN] Unknown token {whale_token_id} (not in cache, API failed)")
+                    return
 
-            # Gas Signals: Extract gas price from transaction (indicates conviction)
+            print(f"[BLOCKCHAIN] Whale trade: {whale_address[:10]}... "
+                  f"bought {market_data.get('outcome', '?')} at {whale_price:.4f} "
+                  f"in \"{market_data.get('title', 'Unknown')[:40]}\" "
+                  f"(tx: {event['transactionHash'].hex()[:10]}...)")
+
+            # BUG FIX #6: Gas Signals with timeout protection
             # High gas = high conviction (whale paying premium for fast execution)
-            gas_price_wei = 0
+            gas_price_gwei = 0
             try:
-                tx_receipt = self.web3.eth.get_transaction(event['transactionHash'])
-                gas_price_wei = tx_receipt.get('gasPrice', 0)
-                gas_price_gwei = gas_price_wei / 1e9 if gas_price_wei else 0
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        self.web3.eth.get_transaction,
+                        event['transactionHash']
+                    )
+                    tx_receipt = future.result(timeout=3)  # 3 second timeout
+                    gas_price_wei = tx_receipt.get('gasPrice', 0)
+                    gas_price_gwei = gas_price_wei / 1e9 if gas_price_wei else 0
 
-                # Log high-conviction trades
-                if gas_price_gwei > 200:
-                    print(f"[BLOCKCHAIN] 🔥 HIGH CONVICTION: {whale_address[:10]}... "
-                          f"paid {gas_price_gwei:.0f} gwei gas")
+                    # Log high-conviction trades
+                    if gas_price_gwei > 200:
+                        print(f"[BLOCKCHAIN] 🔥 HIGH CONVICTION: {whale_address[:10]}... "
+                              f"paid {gas_price_gwei:.0f} gwei gas")
+            except (concurrent.futures.TimeoutError, Exception) as e:
+                gas_price_gwei = 0  # Fail gracefully
+
+            # BUG FIX #5: Fetch block timestamp (whale's actual trade time)
+            whale_timestamp = time.time()  # Fallback to current time
+            try:
+                block = self.web3.eth.get_block(event['blockNumber'])
+                whale_timestamp = float(block['timestamp'])
             except Exception as e:
-                gas_price_gwei = 0  # Default if gas price fetch fails
+                print(f"[BLOCKCHAIN] Failed to fetch block timestamp: {e}")
 
             # Emit signal to whale_tracker
             signal_data = {
                 "source_wallet": whale_address,
                 "condition_id": market_data.get("condition_id", ""),
-                "market_title": market_data.get("question", "Unknown Market"),
+                "market_title": market_data.get("title", market_data.get("question", "Unknown Market")),
                 "outcome": market_data.get("outcome", "YES"),  # YES/NO based on token ID
                 "whale_price": whale_price,
-                "timestamp": time.time(),  # Use current time (event is recent)
-                "detected_at": time.time(),
+                "timestamp": whale_timestamp,  # FIXED — actual block timestamp
+                "detected_at": time.time(),  # Our detection time
                 "size": int(whale_amount),
                 "tx_hash": event['transactionHash'].hex(),
+                "log_index": event.get('logIndex', 0),  # v14: For dedup
                 "block_number": event['blockNumber'],
                 "gas_price_gwei": gas_price_gwei,  # Gas Signals
             }

@@ -1,6 +1,7 @@
 import os
 import time
 import json
+from src.state_backup import save_state_with_backup, load_state_with_recovery
 
 RISK_STATE_FILE = "data/risk_state.json"
 
@@ -74,32 +75,30 @@ class RiskGuard:
             self._save_state()  # Persist the reset
 
     def _save_state(self):
-        """Persist exposure and daily loss to disk (atomic write)."""
-        os.makedirs("data", exist_ok=True)
+        """Persist exposure and daily loss to disk (atomic write with backup)."""
         state = {
+            "version": 1,
             "current_exposure": self.current_exposure,
             "daily_loss": self.daily_loss,
             "day_start": self._day_start,
+            "last_updated": time.time(),
         }
-        tmp = RISK_STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp, RISK_STATE_FILE)  # Atomic
+        save_state_with_backup(RISK_STATE_FILE, state, generations=5)
 
     def _load_state(self):
-        """Load persisted exposure and daily loss from disk."""
-        if not os.path.exists(RISK_STATE_FILE):
-            return  # First run, no state yet
+        """Load persisted exposure and daily loss from disk (with auto-recovery)."""
+        state = load_state_with_recovery(
+            RISK_STATE_FILE,
+            required_keys=["current_exposure", "daily_loss", "day_start"]
+        )
 
-        try:
-            with open(RISK_STATE_FILE, "r") as f:
-                state = json.load(f)
+        if not state:
+            print("[RISK] No valid state found — starting fresh")
+            return
 
-            self.current_exposure = state.get("current_exposure", 0.0)
-            self.daily_loss = state.get("daily_loss", 0.0)
-            self._day_start = state.get("day_start", time.time())
+        self.current_exposure = state.get("current_exposure", 0.0)
+        self.daily_loss = state.get("daily_loss", 0.0)
+        self._day_start = state.get("day_start", time.time())
 
-            print(f"[RISK] Loaded state: exposure=${self.current_exposure:.2f}, "
-                  f"daily_loss=${self.daily_loss:.2f}")
-        except Exception as e:
-            print(f"[RISK] Failed to load state: {e} — starting fresh")
+        print(f"[RISK] Loaded state: exposure=${self.current_exposure:.2f}, "
+              f"daily_loss=${self.daily_loss:.2f}")

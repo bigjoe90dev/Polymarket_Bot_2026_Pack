@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+from src.state_backup import save_state_with_backup, load_state_with_recovery
 
 SCORER_STATE_FILE = "data/wallet_scores.json"
 
@@ -62,23 +63,24 @@ class WalletScorer:
     # ── State Persistence ─────────────────────────────────────
 
     def _load_state(self):
-        if os.path.exists(SCORER_STATE_FILE):
-            try:
-                with open(SCORER_STATE_FILE, "r") as f:
-                    state = json.load(f)
-                self.wallet_stats = state.get("wallet_stats", {})
-                self.market_types = state.get("market_types", {})
-                self.flow_events = state.get("flow_events", [])
-                total = len(self.wallet_stats)
-                scored = sum(1 for w in self.wallet_stats.values() if w.get("total_copies", 0) >= 3)
-                print(f"[SCORER] Loaded {total} wallets ({scored} with 3+ copies scored)")
-                return
-            except Exception:
-                pass
-        print("[SCORER] Starting fresh — will build wallet scores from copy results")
+        state = load_state_with_recovery(
+            SCORER_STATE_FILE,
+            required_keys=["wallet_stats", "market_types", "flow_events"]
+        )
+
+        if not state:
+            print("[SCORER] No valid state found — starting fresh")
+            return
+
+        self.wallet_stats = state.get("wallet_stats", {})
+        self.market_types = state.get("market_types", {})
+        self.flow_events = state.get("flow_events", [])
+
+        total = len(self.wallet_stats)
+        scored = sum(1 for w in self.wallet_stats.values() if w.get("total_copies", 0) >= 3)
+        print(f"[SCORER] Loaded {total} wallets ({scored} with 3+ copies scored)")
 
     def _save_state(self):
-        os.makedirs(os.path.dirname(SCORER_STATE_FILE), exist_ok=True)
         try:
             # Trim flow events to last 2000
             if len(self.flow_events) > 2000:
@@ -89,15 +91,15 @@ class WalletScorer:
                 self.market_types = {k: self.market_types[k] for k in keys[-500:]}
 
             state = {
+                "version": 1,
                 "wallet_stats": self.wallet_stats,
                 "market_types": self.market_types,
                 "flow_events": self.flow_events,
                 "last_updated": time.time(),
             }
-            tmp = SCORER_STATE_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(state, f)
-            os.replace(tmp, SCORER_STATE_FILE)
+
+            save_state_with_backup(SCORER_STATE_FILE, state, generations=5)
+
         except Exception as e:
             print(f"[!] Scorer state save error: {e}")
 

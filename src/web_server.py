@@ -47,6 +47,7 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
             "/api/flows": self._api_flows,
             "/api/stress": self._api_stress,
             "/api/blockchain": self._api_blockchain,
+            "/api/clob": self._api_clob,
             "/api/live_trades": self._api_live_trades,
         }
 
@@ -117,7 +118,48 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
         if not pe:
             self._send_json({"positions": []})
             return
-        self._send_json({"positions": pe.get_positions()})
+        
+        positions = pe.get_positions()
+        bot = self.server.bot_ref
+        
+        # v14: Add resolution times to positions
+        for pos in positions:
+            condition_id = pos.get("condition_id", "")
+            resolves_at = "Unknown"
+            resolves_timestamp = None
+            
+            if condition_id and bot and bot.market:
+                try:
+                    market_info = bot.market.client.get_market(condition_id)
+                    if market_info:
+                        # Try different field names for end date
+                        end_date = (market_info.get("end_date_iso") or
+                                   market_info.get("end_date") or
+                                   market_info.get("expiry_date"))
+                        
+                        if end_date:
+                            from datetime import datetime
+                            try:
+                                # Parse ISO 8601 datetime
+                                if isinstance(end_date, str):
+                                    dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                                    resolves_at = dt.strftime("%b %d, %I:%M %p")
+                                    resolves_timestamp = dt.timestamp()
+                            except (ValueError, TypeError):
+                                pass
+                except Exception as e:
+                    pass  # Keep "Unknown" on error
+            
+            pos["resolves_at"] = resolves_at
+            pos["resolves_timestamp"] = resolves_timestamp
+        
+        # Sort by resolution time (soonest first, Unknown at end)
+        positions.sort(key=lambda p: (
+            p.get("status") != "OPEN",  # Open positions first
+            p.get("resolves_timestamp") or float('inf')  # Soonest expiry first
+        ))
+        
+        self._send_json({"positions": positions})
 
     def _api_trades(self):
         pe = self.server.paper_engine
@@ -257,7 +299,7 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
         monitor = bot.blockchain_monitor
         data = {
             "enabled": True,
-            "connected": monitor.web3.is_connected() if hasattr(monitor, 'web3') else False,
+            "connected": monitor.connected if hasattr(monitor, 'connected') else False,  # v14: Use boolean flag instead of web3.is_connected() to avoid WebSocket leak
             "running": monitor.running,
             "wallets_tracked": len(monitor.tracked_wallets),
             "wallets_discovered": monitor.wallets_discovered,  # Network Discovery
@@ -273,6 +315,25 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
             except:
                 data["current_block"] = None
 
+        self._send_json(data)
+
+    def _api_clob(self):
+        """Return CLOB WebSocket monitor status and metrics."""
+        bot = self.server.bot_ref
+        if not hasattr(bot, 'clob_websocket') or not bot.clob_websocket:
+            self._send_json({"enabled": False, "reason": "CLOB WebSocket not configured"})
+            return
+
+        monitor = bot.clob_websocket
+        data = {
+            "enabled": True,
+            "connected": monitor.is_connected() if hasattr(monitor, 'is_connected') else False,
+            "running": monitor.running if hasattr(monitor, 'running') else False,
+            "messages_received": monitor.messages_received if hasattr(monitor, 'messages_received') else 0,
+            "signals_emitted": monitor.signals_emitted if hasattr(monitor, 'signals_emitted') else 0,
+            "last_message_time": monitor.last_message_time if hasattr(monitor, 'last_message_time') else None,
+            "reconnect_count": monitor.reconnect_count if hasattr(monitor, 'reconnect_count') else 0,
+        }
         self._send_json(data)
 
     def _api_live_trades(self):

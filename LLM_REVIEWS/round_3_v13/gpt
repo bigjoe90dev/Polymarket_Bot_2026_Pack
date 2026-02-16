@@ -1,0 +1,313 @@
+I’m going to open the ZIP, read **AUDIT_PROMPT.md** first, then do a targeted code review of the files you listed (with extra attention to the new WebSocket monitor), and finish with a severity-ranked findings list plus concrete patch suggestions.
+
+
+## A) Executive Summary
+
+Overall verdict: **Needs work (not production-ready for LIVE)**. v11’s core fixes (curved fee math + entry staleness using the whale’s timestamp + exposure persistence) are **implemented**, but v12’s “competitive edge” (on-chain monitoring) is currently **non-functional as an execution edge**: signals aren’t consumed by the main loop, and the on-chain event decoding has placeholder logic that can mis-identify outcome/price/size. Biggest strength: the paper engine is thoughtfully defensive (stress layers + winner’s-curse cap + anti-hedge + persistent state). Biggest risk: you will either (a) not trade at all on v12 signals, or (b) trade the **wrong side** with **wrong sizing** if you wire it in naïvely. Next: fix the v12 signal pipeline end-to-end (decode → normalize → queue → consume → de-dupe), then run “shadow parity” where on-chain events are matched against Data API trades for a few days to validate correctness before any LIVE steps.
+
+---
+
+## B) Critical Issues (Must Fix Before LIVE)
+
+### 1) **Blockchain signals are never executed**
+
+* **Severity:** High
+* **Location:** `src/bot.py:TradingBot.run` (lines ~133–162) + `src/whale_tracker.py:add_blockchain_signal` (lines ~703–770)
+* **Why it matters:** Your WebSocket monitor can detect events, but the bot only executes `signals = self.whale_tracker.poll_whale_activity()`. `add_blockchain_signal()` appends to `recent_signals`, which is **not drained** anywhere for execution. Net effect: v12 “edge” produces **zero trades** (or only the slow polling trades).
+* **Exact fix (minimal):**
+
+  1. In `WhaleTracker.__init__`, add a thread-safe queue:
+
+     * `self._bc_queue = deque()` and `self._bc_lock = threading.Lock()`
+  2. In `add_blockchain_signal`, push into `_bc_queue` under lock (not `recent_signals`).
+  3. Add `drain_blockchain_signals(self, max_n=100)` that pops items under lock and returns a list.
+  4. In `TradingBot.run`, do:
+
+     * `signals = polled + self.whale_tracker.drain_blockchain_signals()`
+  5. Add tx-hash de-dupe on enqueue so the later polling pass doesn’t double-fire.
+
+---
+
+### 2) **On-chain decoding uses placeholder logic for outcome and token mapping**
+
+* **Severity:** High
+* **Location:** `src/blockchain_monitor.py:_get_outcome_from_token_id` (lines ~299–306), `_process_order_filled` (lines ~202–289)
+* **Why it matters:** `_get_outcome_from_token_id()` currently does `token_id_hex.endswith("00")` → YES else NO. That is almost certainly wrong. Also `_process_order_filled` guesses which asset ID corresponds to the “whale outcome token” via:
+
+  * `whale_token_id = taker_asset_id if whale_side == "maker" else maker_asset_id`
+    This can invert buys/sells depending on whether the whale was maker/taker and which side was collateral/outcome. If you ever wire this into LIVE, you can systematically trade the **wrong side**.
+* **Exact fix:** You need a real mapping:
+
+  * Maintain a dictionary built at startup from the market catalog: `{token_id -> (condition_id, outcome_label, market_title, slug)}` using your existing market list / CLOB metadata.
+  * Identify collateral vs outcome by **known collateral asset id / contract**, or by checking whether the asset ID exists in your token map.
+  * Determine direction (BUY/SELL of an outcome token) by: “did the whale’s net outcome token balance increase or decrease?” For `OrderFilled`, infer which asset is outcome; then:
+
+    * If whale **received** outcome tokens → treat as BUY signal.
+    * If whale **gave** outcome tokens → treat as SELL/EXIT signal.
+
+---
+
+### 3) **Market lookup in the blockchain monitor is likely broken and too slow**
+
+* **Severity:** High
+* **Location:** `src/blockchain_monitor.py:_fetch_market_from_token_id` (lines ~311–336)
+* **Why it matters:** It calls a hard-coded Gamma URL with `token_id={hex(token_id)}`. Even if the endpoint exists, sending **hex IDs** is usually wrong, and doing an HTTP fetch **per event** is latency poison (and a free-tier rate-limit magnet). If this fails, you drop trades; if it’s slow, you lose your latency edge.
+* **Exact fix:** Remove per-event HTTP lookups:
+
+  * Pass a `token_id -> market_info` resolver into `BlockchainMonitor` (built from `MarketDataService.get_active_markets()` and/or a one-time metadata fetch).
+  * Cache misses with LRU; never block the event loop on network unless you can’t proceed.
+
+---
+
+### 4) **WebSocket reconnection isn’t robust; filter usage can silently stall**
+
+* **Severity:** High
+* **Location:** `src/blockchain_monitor.py:_connect_and_subscribe` (lines ~71–133), `_monitor_loop` (lines ~138–194)
+* **Why it matters:** You create an `eth_newFilter` and poll `get_new_entries()`. If the WS connection drops, the provider may be dead; simply looping and calling `_connect_and_subscribe()` again without **rebuilding the provider + contract + filter** can leave you in a state where you “think” you’re connected but receive nothing, or repeatedly error. Also `fromBlock="latest"` means you will miss events during disconnect windows.
+* **Exact fix (practical, local-only):**
+
+  * On reconnect, rebuild **everything**: provider → Web3 → contract → filter.
+  * Keep `last_seen_block` and on resubscribe set `fromBlock=last_seen_block-2` (small backfill) to avoid missing events on reconnect.
+  * Add a “no events for N minutes” watchdog: force resubscribe.
+
+---
+
+### 5) **Fee-rate lookup API is missing; you are always using the fallback bps**
+
+* **Severity:** High
+* **Location:** `src/paper_engine.py:_get_fee_rate` (lines ~687–699) + `src/market.py` (no `get_fee_rate_bps`)
+* **Why it matters:** `_get_fee_rate` calls `self.market_client.get_fee_rate_bps(token_id)`, but `MarketDataService` doesn’t implement it. That means you always fall back to `DEFAULT_FEE_BPS = 200` (2%). This makes paper results **wrong in both directions**:
+
+  * **Too pessimistic** for 0-fee markets (you’re charging fees that won’t exist).
+  * **Too optimistic** for high-fee markets (you’re under-charging vs 1000 bps).
+* **Exact fix options:**
+
+  1. **Implement `get_fee_rate_bps`** in `MarketDataService` (preferred if the CLOB client exposes it).
+  2. If not available: infer fee tier using `WalletScorer.classify_market()` + title patterns (you already detect `crypto_fast`). For example:
+
+     * `crypto_fast` → 1000 bps, else 0 bps (or conservative 200 only when unknown).
+  3. Store fee tier in the token→market map and pass it into signals.
+
+---
+
+### 6) **Exit staleness fix is only applied to entries; exits still use detection time**
+
+* **Severity:** Medium
+* **Location:** `src/paper_engine.py:close_copy_position` (line ~593), `_auto_sell` (lines ~713–717 uses `signal_age_sec=0`)
+* **Why it matters:** v11 fixed entry staleness by using the whale timestamp; but exit logic still uses `detected_at` (or even hardcodes 0). This can make exits unrealistically favorable (paper too optimistic) or inconsistent across exit types.
+* **Exact fix:** Mirror the entry logic:
+
+  * `whale_exit_time = signal.get("timestamp", signal.get("detected_at", time.time()))`
+  * `signal_age = time.time() - whale_exit_time`
+  * Feed that into `stress_exit()` everywhere (including `_auto_sell`).
+
+---
+
+### 7) **Wallet address normalization is inconsistent; blockchain signals can be dropped**
+
+* **Severity:** Medium
+* **Location:** `src/whale_tracker.py:discover_whales` (lines ~199–214), `add_blockchain_signal` (lines ~706–725)
+* **Why it matters:** `discover_whales` stores `proxyWallet` keys as-is. `add_blockchain_signal` lowercases the incoming address before checking membership. If the stored keys are mixed-case, you’ll falsely log “untracked wallet” and drop valid blockchain signals.
+* **Exact fix:** Normalize everywhere:
+
+  * When inserting into `tracked_wallets` / `network_wallets`, store `wallet = wallet.lower()`.
+  * When passing addresses into the blockchain monitor, lower them first and checksum inside the monitor.
+
+---
+
+### 8) **Timestamp type/unit safety is not guaranteed**
+
+* **Severity:** Medium
+* **Location:** `src/whale_tracker.py:poll_whale_activity` (lines ~541–557, ~602–624), `src/paper_engine.py:execute_copy_trade` (lines ~426–433)
+* **Why it matters:** If the Data API ever returns timestamps in ms or as strings, `time.time() - whale_trade_time` can become wildly wrong or throw. You already cast timestamps to `float()` in `_seed_history`, but not in signal creation.
+* **Exact fix:** On signal build, normalize:
+
+  * `ts = trade.get("timestamp", now); ts = float(ts) if ts else now; if ts > 1e12: ts /= 1000.0`
+
+---
+
+## C) Edge Analysis
+
+### Copy trading breakeven math (simple, load-bearing)
+
+For a binary share bought at effective cost `p_eff` per share (price + fees + per-share gas), if you hold to resolution, expected value per share:
+
+* **EV = w − p_eff**, where `w` is your true win probability (probability the outcome resolves in your favor).
+* **Breakeven:** `w > p_eff`.
+
+Your curved fee model is implemented as:
+
+* `fee_per_share = (bps/10000) * p * (1-p)` ✅ (your `paper_fees.py` matches this)
+
+So **effective p** increases by:
+
+* entry slippage (you pay a higher `p`)
+* `fee_per_share`
+* (optional) per-share gas, which is tiny at large size, huge at tiny size
+
+**Example (entry only, hold to settle):**
+
+* If `p=0.55`, fee tier 1000 bps:
+
+  * `fee_per_share = 0.10 * 0.55 * 0.45 = 0.02475`
+  * If your slippage makes you buy at `p=0.57`, then `fee_per_share ≈ 0.10*0.57*0.43 = 0.02451`
+  * `p_eff ≈ 0.57 + 0.0245 = 0.5945`
+  * You need **~59.5%** win rate *just to break even* (before considering exits / second trade fees).
+
+If you **also sell** (TP/SL or whale exit), you pay the curved fee again on the sell (and likely more slippage). That can easily push breakeven into the **60–70%** range on high-fee markets unless your average win size dominates your losses.
+
+### What your “2–3s latency” really buys you
+
+* Your stress sim caps staleness at **5%**, and adds **0.1% per second** (up to cap).
+* Moving from 5–12 minutes polling (staleness hitting cap) to ~3 seconds reduces staleness penalty from **~5%** to **~0.3%**. That’s huge.
+
+But: **on-chain is still post-trade**. You’re not seeing intent; you’re seeing the trade after it has executed and been mined. It can still be an edge versus 5–12 minute polling, but it is not “HFT parity” unless your execution path (CLOB order placement + matching) is equally optimized and your decoding is correct.
+
+### Arb strategy assessment
+
+Your own code disables the arb scanner by default for negative EV. Based on the architecture, that’s rational: two-leg execution on a competitive CLOB is fragile, and you’ll bleed on partial fills + adverse selection. I would keep it off until you can prove fill quality with real book data and conservative hedging costs.
+
+### “Probability of profitability over 6 months” (with reasoning)
+
+Given the current v12 implementation **as-is**, probability of profitability is **low** because the real-time pipeline is not actually driving trades, and the decoder is not trustworthy. After fixing the pipeline and validating on-chain events against known trades for a few days, profitability depends on:
+
+* whales’ true edge (are they informational, or are they hedging / farming / arbitraging?)
+* your fee tier exposure (high-fee markets demand very high hit-rate or high payoff ratio)
+* your realized slippage distribution at your actual trade sizes
+
+If (and only if) you restrict to:
+
+* low/zero-fee markets **or** whales with demonstrably high win-rate in the high-fee category,
+* confirmed correct side mapping and correct price reconstruction,
+* and your median slippage is under ~1% (not the 4–10% tail),
+  then a **moderate** chance of profitability is plausible. Without those constraints, you’re mostly paying friction.
+
+---
+
+## D) Risk & Failure Mode Review (Top 10)
+
+1. **Wrong-side trading** from incorrect token/outcome mapping (currently a real risk).
+2. **Silent stall** in WebSocket/log filter leading to no signals for hours.
+3. **Duplicate trades** when the same whale trade arrives via blockchain + later polling (no shared de-dupe pipeline).
+4. **State drift** between RiskGuard exposure file and actual open positions after restarts.
+5. **Fee tier mismatch** makes paper results untrustworthy (both overly pessimistic and optimistic depending on market).
+6. **Thread safety issues**: blockchain thread mutates whale tracker lists/dicts while main loop iterates (can lose signals or corrupt ordering).
+7. **Mac sleep / network blips**: bot appears “running” but isn’t trading or isn’t monitoring.
+8. **Clock skew** impacts staleness and expiry parsing.
+9. **Market metadata mismatch**: token IDs on-chain don’t map to your CLOB token ids 1:1 (possible depending on protocol details).
+10. **Adversarial whale behavior**: whales may split orders, hedge, or use proxy contracts; copying blindly can replicate their risk, not their alpha.
+
+**Kill-switch/circuit breaker improvements (local-only):**
+
+* If no heartbeat update + no trades + no events for X minutes, alert + restart monitor.
+* If monitor reconnects > N times/hour, disable copy trading and alert.
+* If signal decoding fails > N times in a window, disable monitor and fall back to polling.
+
+---
+
+## E) Paper-to-Live Gap
+
+### Where paper is faithful
+
+* Position accounting, cash debits/credits, and persistence are structured sensibly.
+* Stress layers capture many real frictions (rejections, partials, slippage, rate limits).
+
+### Where paper is optimistic
+
+* Fee tiers are currently wrong (default 200 bps).
+* Exit staleness is understated (`detected_at` / hardcoded 0 in auto-sell).
+* Slippage is not strongly size-dependent; in real books, size is destiny.
+
+### Where paper is pessimistic (possibly too pessimistic)
+
+* With a truly fast signal path, your **base** slippage + timing drift + staleness can double-count latency. If your measured median move in 2–3 seconds is small, a constant 1.5% base slippage may be too harsh.
+
+### Validation steps required before trusting v12
+
+1. **Shadow mode:** record every on-chain `OrderFilled` you detect + the Data API trade you later see for the same tx hash. Verify:
+
+   * same wallet
+   * same direction
+   * same market/token mapping
+   * reconstructed price within tolerance
+2. **Slippage calibration:** for each shadow signal, snapshot CLOB best ask/bid at detection time and at +1s/+3s. Use this to fit your slippage distribution.
+3. **Fee tier verification:** label markets by fee tier and confirm your classifier matches reality.
+
+---
+
+## F) Scaling Assessment ($500 / $2k / $5k+)
+
+### What breaks as you scale
+
+* **Liquidity:** your copy budgets rise with balance, but your execution model doesn’t cap size by order-book depth for the specific token. At $2k–$5k, you can easily become the slippage.
+* **Correlation:** multiple whales converging on the same market (your “consensus” boost) increases correlation and drawdown risk.
+* **Operational:** more trades → more writes → higher chance of state races and file corruption (still low, but higher).
+
+### Recommended deployment path (local-only)
+
+* **$500:** cap per-trade not just by pct of balance, but by “depth within X bps of best price.”
+* **$2k:** require a minimum liquidity threshold per token and increase winner’s curse strictness (or require limit-style entries).
+* **$5k+:** stop scaling unless you can show that at your intended size, median slippage remains stable. If slippage rises with size, scaling becomes negative EV fast.
+
+---
+
+## G) Architecture & Ops Grade
+
+* **Code quality grade:** **C+** (good intent and structure, but v12 core correctness gaps + missing interfaces + thread safety gaps)
+* **Production readiness score:** **38 / 100** (paper engine decent; real-time edge not yet correct or integrated)
+
+### 24/7 MacBook operational checklist (minimum viable)
+
+* Prevent sleep: run under `caffeinate` (or macOS Energy settings).
+* Auto-restart on crash: `launchd` plist (restarts run.py).
+* Log hygiene: redirect stdout/stderr to rotating files; cap size.
+* Disk guardrails: cap state/history sizes (you already cap some), ensure snapshots don’t grow unexpectedly.
+* Alerts: Telegram alert on:
+
+  * watchdog timeout
+  * monitor reconnect loops
+  * “no events for N minutes”
+  * repeated decode/lookup failures
+* Backups: keep last-good copies of JSON state files (e.g., `.bak` on each save).
+
+---
+
+## H) Brutal Honesty Take
+
+Right now, v12 is **not** delivering its promised edge. The biggest flaw that could sink it is **incorrect or unconsumed blockchain signals**—you either won’t trade, or you’ll trade the wrong thing. If this were my own $5,000, I would **not** run LIVE until:
+
+1. the on-chain decoder is proven correct against ground truth,
+2. the signal queue is drained deterministically by the main loop with de-dupe,
+3. fee tiers are modeled correctly per market category,
+4. exits use the same timestamp discipline as entries, and
+5. sizing is constrained by real order-book depth at your intended size.
+
+---
+
+# Answers to Your Specific Questions
+
+1. **Blockchain Monitor race conditions / reconnection robustness?**
+
+   * Race: yes—callback runs in the monitor thread and mutates whale tracker state without a queue/lock. You can lose signals or create ordering bugs.
+   * Reconnection: not robust enough—rebuild provider/contract/filter on reconnect, backfill blocks, and add “no events” resubscribe.
+
+2. **Fee formula `fee = (bps/10000) * price * (1-price)` correct?**
+
+   * **Yes**, as implemented in `src/paper_fees.py`. The bigger issue is **fee tier selection**—you aren’t actually retrieving the real bps right now.
+
+3. **Atomic writes vs CRC checksums?**
+
+   * Atomic rename prevents partial writes, which is the main killer. CRC/sha is a **nice-to-have** for silent corruption, but higher ROI is: schema version + backup last-good file + strict type validation on load.
+
+4. **With 2–3s latency, realistic win rate vs fees+slippage?**
+
+   * In high-fee markets (e.g., 1000 bps), breakeven win rate can easily be **~60%+** once you include slippage and (if you exit) a second fee.
+   * In zero-fee markets, breakeven often lands closer to `p + slippage` (e.g., buy at 0.55 with ~1% slippage → need ~56% win rate).
+   * The real determinant is your *measured* slippage at your chosen size + fee tier exposure. Right now you don’t have validated numbers for the v12 path.
+
+5. **Stress simulation too pessimistic?**
+
+   * Possibly. If you truly reduce staleness to ~0.3%, your sim still includes base slippage + timing drift that may over-penalize latency twice.
+   * But: until v12 decoding + execution is validated, pessimism is protective. Calibrate using shadow-mode measurements rather than guessing.
+
+If you want, I can propose concrete patches (diff-style) for the **signal queue + normalization + reconnection rebuild + timestamp normalization**, because those are the “make v12 real” blockers.

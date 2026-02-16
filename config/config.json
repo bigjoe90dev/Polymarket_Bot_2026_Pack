@@ -1,5 +1,5 @@
 {
-  "_config_version": 12,
+  "_config_version": 14,
   "MIN_PROFIT": 0.003,
   "COST_BUFFER": 0.002,
   "MIN_LIQUIDITY": 0.5,
@@ -16,12 +16,12 @@
   "MODE": "PAPER",
   "POLY_API_KEY": "paper-mode",
   "POLY_SECRET": "paper-mode",
-  "POLY_PASSPHRASE": "paper-mode",
+  "POLY_PASSPHRASE": "",
   "PAPER_BALANCE": 100.0,
   "WEB_PORT": 8080,
   "COLLECT_DATA": true,
   "INFRA_TIER": 1,
-  "DASHBOARD_TOKEN": "f8610155b1c844fc",
+  "DASHBOARD_TOKEN": "polymarket",
   "DASHBOARD_BIND": "127.0.0.1",
   "TAKE_PROFIT_PCT": 0.15,
   "STOP_LOSS_PCT": 0.25,
@@ -38,5 +38,15 @@
   "SL_SLOW_PCT": 0.15,
   "ENABLE_ARB_SCANNER": false,
   "USE_BLOCKCHAIN_MONITOR": true,
-  "POLYGON_RPC_WSS": "wss://polygon-mainnet.g.alchemy.com/v2/4E4PTO7MaNxc1-DTnly3w"
+  "POLYGON_RPC_WSS": "wss://polygon-mainnet.g.alchemy.com/v2/bv3H2O33-VKeHtKmU1fhI",
+  "USE_CLOB_WEBSOCKET": true,
+  "CLOB_WS_URL": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+  "METRICS_LOGGING_ENABLED": true,
+  "METRICS_LOG_INTERVAL_SEC": 60,
+  "PARITY_CHECK_ENABLED": true,
+  "HEALTH_MONITOR_ENABLED": true,
+  "HEALTH_CHECK_INTERVAL_SEC": 30,
+  "MIN_BLOCKCHAIN_CONFIRMATIONS": 0,
+  "MAX_PRICE_CHASE_PCT": 0.05,
+  "STATE_BACKUP_GENERATIONS": 5
 }

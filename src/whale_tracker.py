@@ -18,6 +18,10 @@ import json
 import time
 import os
 import requests
+import queue
+import threading
+import hashlib
+from src.state_backup import save_state_with_backup, load_state_with_recovery
 
 DATA_API = "https://data-api.polymarket.com"
 WHALE_STATE_FILE = "data/whale_state.json"
@@ -37,6 +41,7 @@ MIN_AVG_HOLD_HOURS = 0.25            # Swing Test: avg hold > 15min (catches mic
 SEED_HISTORY_LIMIT = 50             # Trades to fetch for forensic analysis
 MAX_WASH_RATIO = 0.30               # Wash Test: max % of round-trip trades
 MIN_SLOW_RATIO = 0.70                # Skip wallets where >70% of trades are in slow/long-term markets
+SIGNAL_DEDUP_TTL = 1800              # 30 minutes - global signal dedup time-to-live
 
 
 class WhaleTracker:
@@ -57,32 +62,48 @@ class WhaleTracker:
         self._poll_errors = 0
         self._slow_skips = 0            # Markets skipped for being slow
         self._discovery_stats = {"leaderboard": 0, "network": 0, "pages_fetched": 0}
+
+        # BUG FIX #1: Thread-safe blockchain signal queue
+        self._blockchain_queue = queue.Queue()  # For real-time blockchain signals
+        self._blockchain_lock = threading.Lock()  # Protects _seen_tx_hashes
+
+        # POLY-101: CLOB WebSocket signal queue (300ms latency)
+        self._clob_queue = queue.Queue()  # For CLOB WebSocket signals
+
+        # v14 ENHANCEMENT: Global signal deduplication across all sources
+        # Prevents duplicate trades when same signal arrives via:
+        # - Blockchain + API polling
+        # - Reconnect backfill
+        # - Provider duplicates
+        self._signal_dedup_cache = {}  # signal_id -> timestamp
+        self._signal_dedup_lock = threading.Lock()
+
         self._load_state()
 
     # ── State Persistence ─────────────────────────────────────
 
     def _load_state(self):
-        if os.path.exists(WHALE_STATE_FILE):
-            try:
-                with open(WHALE_STATE_FILE, "r") as f:
-                    state = json.load(f)
-                self.tracked_wallets = state.get("tracked_wallets", {})
-                self.network_wallets = state.get("network_wallets", {})
-                self._seen_tx_hashes = set(state.get("seen_tx_hashes", []))
-                self._hot_markets = {
-                    k: set(v) for k, v in state.get("hot_markets", {}).items()
-                }
-                total = len(self.tracked_wallets) + len(self.network_wallets)
-                print(f"[WHALE] Loaded {len(self.tracked_wallets)} leaderboard + "
-                      f"{len(self.network_wallets)} network wallets, "
-                      f"{len(self._seen_tx_hashes)} seen txs")
-                return
-            except Exception:
-                pass
-        print("[WHALE] Starting fresh — will discover traders from leaderboard")
+        state = load_state_with_recovery(
+            WHALE_STATE_FILE,
+            required_keys=["tracked_wallets", "network_wallets"]
+        )
+
+        if not state:
+            print("[WHALE] No valid state found — starting fresh")
+            return
+
+        self.tracked_wallets = state.get("tracked_wallets", {})
+        self.network_wallets = state.get("network_wallets", {})
+        self._seen_tx_hashes = set(state.get("seen_tx_hashes", []))
+        self._hot_markets = {
+            k: set(v) for k, v in state.get("hot_markets", {}).items()
+        }
+
+        print(f"[WHALE] Loaded {len(self.tracked_wallets)} leaderboard + "
+              f"{len(self.network_wallets)} network wallets, "
+              f"{len(self._seen_tx_hashes)} seen txs")
 
     def _save_state(self):
-        os.makedirs(os.path.dirname(WHALE_STATE_FILE), exist_ok=True)
         try:
             # Snapshot dicts to avoid "dictionary changed size" during iteration
             # (watchdog thread may call _save_state while main thread modifies dicts)
@@ -99,16 +120,16 @@ class WhaleTracker:
             hot_snap = dict(list(self._hot_markets.items())[-100:])
 
             state = {
+                "version": 1,
                 "tracked_wallets": tracked_snap,
                 "network_wallets": network_snap,
                 "seen_tx_hashes": seen_list,
                 "hot_markets": {k: list(v) for k, v in hot_snap.items()},
                 "last_updated": time.time(),
             }
-            tmp = WHALE_STATE_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(state, f)
-            os.replace(tmp, WHALE_STATE_FILE)
+
+            save_state_with_backup(WHALE_STATE_FILE, state, generations=5)
+
         except Exception as e:
             print(f"[!] Whale state save error: {e}")
 
@@ -196,7 +217,8 @@ class WhaleTracker:
         # Register discovered traders
         new_wallets = []
         for trader in all_traders:
-            wallet = trader.get("proxyWallet", "")
+            # BUG FIX #7: Normalize wallet address to lowercase
+            wallet = trader.get("proxyWallet", "").lower()
             if not wallet:
                 continue
 
@@ -601,6 +623,7 @@ class WhaleTracker:
 
                 signal = {
                     "type": "COPY_TRADE",
+                    "source": "api",  # v14: Mark source for dedup
                     "source_wallet": wallet_to_poll,
                     "source_username": info.get("username", "?"),
                     "source_rank": info.get("rank", "?"),
@@ -622,6 +645,10 @@ class WhaleTracker:
                     "consensus": market_traders,
                     "score": score,
                 }
+
+                # v14: Global deduplication check
+                if self.is_duplicate_signal(signal):
+                    continue  # Skip duplicate (already processed via blockchain or earlier poll)
 
                 signals.append(signal)
                 info["trades_copied"] = info.get("trades_copied", 0) + 1
@@ -671,7 +698,11 @@ class WhaleTracker:
         """Return all tracked wallets (both leaderboard and network)."""
         wallets = []
 
-        for wallet, info in self.tracked_wallets.items():
+        # BUG FIX: Create snapshots to avoid "dictionary changed size during iteration"
+        tracked_snapshot = dict(self.tracked_wallets)
+        network_snapshot = dict(self.network_wallets)
+
+        for wallet, info in tracked_snapshot.items():
             wallets.append({
                 "wallet": wallet[:8] + "..." + wallet[-4:],
                 "full_wallet": wallet,
@@ -683,7 +714,7 @@ class WhaleTracker:
                 "source": "leaderboard",
             })
 
-        for wallet, info in self.network_wallets.items():
+        for wallet, info in network_snapshot.items():
             wallets.append({
                 "wallet": wallet[:8] + "..." + wallet[-4:],
                 "full_wallet": wallet,
@@ -705,7 +736,10 @@ class WhaleTracker:
         """Add a whale trade signal detected via blockchain monitoring.
 
         Called by blockchain_monitor when a tracked whale trades on-chain.
-        Signal is added to recent_signals queue for copy trading execution.
+        Signal is added to blockchain queue for immediate copy trading execution.
+
+        BUG FIX #1: Now uses thread-safe queue + deduplication to prevent
+        duplicate trades when same signal arrives via blockchain AND polling.
 
         Args:
             whale_address: Checksummed Ethereum address of whale
@@ -719,29 +753,125 @@ class WhaleTracker:
         if wallet not in self.tracked_wallets and wallet not in self.network_wallets:
             return
 
-        # Add to recent signals for copy trading execution
+        # BUG FIX #1: Check deduplication FIRST (prevent duplicate trades)
+        tx_hash = signal_data.get("tx_hash", "")
+        if tx_hash:
+            with self._blockchain_lock:
+                if tx_hash in self._seen_tx_hashes:
+                    return  # Already processed via polling or earlier blockchain event
+                self._seen_tx_hashes.add(tx_hash)
+
+        # Build signal dict for copy trading execution
         signal = {
+            "source": "blockchain",  # Mark as blockchain-sourced (for dedup)
             "source_wallet": wallet,
             "source_username": self.tracked_wallets.get(wallet, {}).get("username", "Blockchain Whale"),
             "condition_id": signal_data.get("condition_id", ""),
             "market_title": signal_data.get("market_title", "Unknown"),
             "outcome": signal_data.get("outcome", "YES"),
             "whale_price": signal_data.get("whale_price", 0),
-            "timestamp": signal_data.get("timestamp", time.time()),
-            "detected_at": time.time(),
+            "timestamp": signal_data.get("timestamp", time.time()),  # Whale's trade time
+            "detected_at": time.time(),  # Our detection time
             "size": signal_data.get("size", 0),
-            "tx_hash": signal_data.get("tx_hash", ""),
-            "source": "blockchain",  # Mark as blockchain-sourced
+            "tx_hash": tx_hash,
+            "log_index": signal_data.get("log_index", 0),  # For dedup
+            "gas_price_gwei": signal_data.get("gas_price_gwei", 0),  # Gas Signals
         }
 
-        self.recent_signals.append(signal)
+        # v14: Global deduplication check (prevents double-trading)
+        if self.is_duplicate_signal(signal):
+            return  # Already processed or queued
 
-        # Limit recent signals queue to 100 (memory management)
+        # BUG FIX #1: Add to blockchain queue for execution (thread-safe)
+        self._blockchain_queue.put(signal)
+
+        # Also add to recent_signals for dashboard display
+        self.recent_signals.append(signal)
         if len(self.recent_signals) > 100:
             self.recent_signals = self.recent_signals[-100:]
 
-        print(f"[BLOCKCHAIN] Signal added: {signal['source_username']} → "
+        print(f"[BLOCKCHAIN] Signal queued for execution: {signal['source_username']} → "
               f"{signal['market_title'][:50]} ({signal['outcome']}) @ ${signal['whale_price']:.3f}")
+
+    def drain_blockchain_signals(self, max_count=50):
+        """Drain blockchain signals for execution (thread-safe).
+
+        BUG FIX #1: New method to consume queued blockchain signals.
+        Called by bot's main loop to process real-time whale trades.
+
+        Args:
+            max_count: Maximum number of signals to drain per call
+
+        Returns:
+            List of signal dicts ready for copy trading execution
+        """
+        signals = []
+        try:
+            while not self._blockchain_queue.empty() and len(signals) < max_count:
+                signals.append(self._blockchain_queue.get_nowait())
+        except queue.Empty:
+            pass
+        return signals
+
+    def add_clob_signal(self, signal):
+        """
+        Add CLOB WebSocket signal (thread-safe).
+        
+        POLY-101: CLOB signals have ~300ms latency (vs 2-3s blockchain).
+        
+        Args:
+            signal: Dict with signal details from CLOBWebSocketMonitor
+        """
+        # Generate unique signal ID for deduplication
+        signal_id = f"clob_{signal.get('condition_id', '')}_{signal.get('source_wallet', '')}_{signal.get('timestamp', 0)}"
+        
+        with self._signal_dedup_lock:
+            # Check for duplicates
+            if signal_id in self._signal_dedup_cache:
+                return  # Already processed
+            
+            # Add to dedup cache
+            self._signal_dedup_cache[signal_id] = time.time()
+            
+            # Clean old entries (keep last 5 minutes)
+            cutoff = time.time() - 300
+            self._signal_dedup_cache = {
+                k: v for k, v in self._signal_dedup_cache.items()
+                if v > cutoff
+            }
+        
+        # Add to CLOB queue for execution
+        self._clob_queue.put(signal)
+        
+        # Also add to recent_signals for dashboard display
+        self.recent_signals.append(signal)
+        if len(self.recent_signals) > 100:
+            self.recent_signals = self.recent_signals[-100:]
+        
+        latency = signal.get('latency_ms', 0)
+        print(f"[CLOB] Signal queued: {signal.get('source_wallet', 'unknown')[:10]}... → "
+              f"{signal.get('market_title', 'Unknown')[:30]} ({signal.get('outcome')}) @ "
+              f"${signal.get('whale_price', 0):.3f} (latency: {latency:.0f}ms)")
+
+    def drain_clob_signals(self, max_count=50):
+        """Drain CLOB signals for execution (thread-safe).
+        
+        POLY-101: New method to consume queued CLOB signals.
+        Called by bot's main loop to process real-time whale trades.
+        
+        Args:
+            max_count: Maximum number of signals to drain per call
+            
+        Returns:
+            List of signal dicts ready for copy trading execution
+        """
+        signals = []
+        try:
+            while not self._clob_queue.empty() and len(signals) < max_count:
+                signals.append(self._clob_queue.get_nowait())
+        except queue.Empty:
+            pass
+        return signals
 
     def add_discovered_wallet(self, discovery_signal):
         """Add a newly discovered wallet from network discovery.
@@ -773,8 +903,72 @@ class WhaleTracker:
         print(f"[WHALE] 🔍 NETWORK DISCOVERY: Added {address[:10]}... "
               f"(${discovery_signal['trade_value']:.0f} trade)")
 
+    # ── Global Signal Deduplication (v14) ────────────────────
+
+    def _get_signal_id(self, signal):
+        """Generate canonical signal ID for deduplication.
+
+        Uses different strategies depending on signal source:
+        - Blockchain: (chain_id, tx_hash, log_index) - most reliable
+        - API: hash(wallet, condition_id, outcome, price, timestamp)
+
+        Returns:
+            str: Unique signal identifier
+        """
+        source = signal.get("source", "api")
+
+        if source == "blockchain":
+            # On-chain signals: use tx_hash as primary key
+            tx_hash = signal.get("tx_hash", "")
+            log_index = signal.get("log_index", 0)
+            return f"chain:{tx_hash}:{log_index}"
+        else:
+            # API signals: hash key fields
+            # Normalize timestamp to 5-second buckets to catch near-duplicates
+            ts_bucket = int(signal.get("timestamp", 0) / 5) * 5
+
+            key_str = "{}:{}:{}:{:.3f}:{}".format(
+                signal.get("source_wallet", "")[:20],
+                signal.get("condition_id", "")[:20],
+                signal.get("outcome", ""),
+                signal.get("whale_price", 0),
+                ts_bucket
+            )
+
+            return "api:" + hashlib.md5(key_str.encode()).hexdigest()
+
+    def is_duplicate_signal(self, signal):
+        """Check if signal is a duplicate across all sources.
+
+        Args:
+            signal: Signal dict
+
+        Returns:
+            bool: True if duplicate, False if new signal
+        """
+        sig_id = self._get_signal_id(signal)
+        now = time.time()
+
+        with self._signal_dedup_lock:
+            # Clean expired entries (older than TTL)
+            expired = [k for k, v in self._signal_dedup_cache.items()
+                      if now - v > SIGNAL_DEDUP_TTL]
+            for k in expired:
+                del self._signal_dedup_cache[k]
+
+            # Check if we've seen this signal
+            if sig_id in self._signal_dedup_cache:
+                return True
+
+            # Record this signal
+            self._signal_dedup_cache[sig_id] = now
+            return False
+
     def get_stats(self):
         total = len(self.tracked_wallets) + len(self.network_wallets)
+        with self._signal_dedup_lock:
+            dedup_cache_size = len(self._signal_dedup_cache)
+
         return {
             "tracked_wallets": total,
             "leaderboard_wallets": len(self.tracked_wallets),
@@ -785,4 +979,5 @@ class WhaleTracker:
             "poll_errors": self._poll_errors,
             "slow_markets_skipped": self._slow_skips,
             "discovery": self._discovery_stats,
+            "dedup_cache_size": dedup_cache_size,
         }

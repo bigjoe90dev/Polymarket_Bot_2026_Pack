@@ -1,0 +1,436 @@
+The GitHub link appears to be a redirect or landing page. Let me try to access the repository directly by looking at the raw files or checking if there's a specific structure.
+The search results show various Polymarket trading bot repositories, but I don't see the specific `bigjoe90dev/Polymarket_Bot_2026_Pack` repository. Let me try to access it directly with different URL patterns.
+I now have access to the key files. Let me also fetch the stress simulator and fee calculation files to complete the audit.
+Now I have all the key files. Let me perform a comprehensive forensic audit.
+
+---
+
+# FORENSIC TECHNICAL AUDIT — Polymarket Copy Trading Bot v12
+
+**Auditor**: Independent Technical Review  
+**Date**: 2026-02-11  
+**Version Audited**: CONFIG_VERSION = 12  
+**Status**: PAPER MODE (Production Readiness Assessment)
+
+---
+
+## A) EXECUTIVE SUMMARY
+
+**Verdict: NEEDS WORK BEFORE LIVE** — The v11 fixes are **verified correct**, but v12 introduces **critical race conditions and architectural flaws** in the blockchain monitor that could cause duplicate trades, missed exits, and state corruption. The fee calculation fix is mathematically sound, but the WebSocket integration has **fundamental threading issues** that violate the bot's core reliability guarantees.
+
+**Biggest Strength**: The stress simulation framework (`stress_sim.py`) is exceptionally well-designed—comprehensive, conservative, and grounded in realistic Polymarket friction. This is the bot's crown jewel.
+
+**Biggest Risk**: The blockchain monitor's callback mechanism bypasses the polling-based deduplication system, creating a **dual-path signal ingestion** that can duplicate trades or process stale signals. The `add_blockchain_signal` method in `whale_tracker.py` lacks transaction hash deduplication, and the threading model between the WebSocket listener and main loop is unsafe.
+
+**What To Do Next**: 
+1. **CRITICAL**: Fix race conditions in blockchain signal ingestion (implement atomic deduplication)
+2. **HIGH**: Add circuit breaker for WebSocket reconnection storms
+3. **MEDIUM**: Verify CRC checksums on state files after unexpected shutdowns
+4. **LOW**: Add schema versioning to all JSON state files
+
+---
+
+## B) CRITICAL ISSUES (Must Fix Before LIVE)
+
+### 1. **Race Condition: Duplicate Trade Risk in Blockchain Monitor** [HIGH]
+**Location**: `src/whale_tracker.py:add_blockchain_signal()` (lines 540-570)  
+**Location**: `src/whale_tracker.py:poll_whale_activity()` (lines 380-420)
+
+**The Bug**: The blockchain monitor emits signals via callback (`on_whale_trade`) which calls `add_blockchain_signal()`. This method **does NOT check `_seen_tx_hashes`** before adding to `recent_signals`. Meanwhile, `poll_whale_activity()` also adds signals and DOES check `_seen_tx_hashes`. This creates a **dual-path ingestion** where:
+- Blockchain path: No deduplication → can add duplicate signals
+- Polling path: Has deduplication → correctly skips duplicates
+
+**Impact**: If a whale trade is detected via BOTH blockchain monitor (2-3s latency) AND polling (5-12min latency), the bot will execute the same copy trade twice—doubling exposure and breaking risk limits.
+
+**Exact Fix** (in `whale_tracker.py:add_blockchain_signal`):
+```python
+def add_blockchain_signal(self, whale_address, signal_data):
+    wallet = whale_address.lower()
+    tx_hash = signal_data.get("tx_hash", "")
+    
+    # CRITICAL FIX: Check deduplication before processing
+    if tx_hash and tx_hash in self._seen_tx_hashes:
+        return  # Already processed via polling or previous block
+    
+    if wallet not in self.tracked_wallets and wallet not in self.network_wallets:
+        return
+    
+    # Add to seen hashes immediately (before any async processing)
+    if tx_hash:
+        self._seen_tx_hashes.add(tx_hash)
+    
+    # ... rest of method
+```
+
+### 2. **Thread Safety Violation: Shared State Mutation Without Locks** [HIGH]
+**Location**: `src/whale_tracker.py:add_blockchain_signal()`  
+**Location**: `src/whale_tracker.py:add_discovered_wallet()`  
+**Location**: `src/blockchain_monitor.py:_emit_network_discovery()` (lines 275-295)
+
+**The Bug**: The blockchain monitor runs in a **daemon thread** (`_monitor_loop`) and calls `add_blockchain_signal()` which mutates `self.recent_signals` (a list). Meanwhile, the main thread in `bot.py` reads from `recent_signals` via `get_recent_signals()`. There is **no threading.Lock()** protecting this shared state.
+
+**Impact**: Memory corruption, lost signals, or `RuntimeError: list changed size during iteration` crashes.
+
+**Exact Fix**:
+```python
+# In WhaleTracker.__init__:
+self._signal_lock = threading.Lock()
+
+# In add_blockchain_signal:
+with self._signal_lock:
+    self.recent_signals.append(signal)
+    if len(self.recent_signals) > 100:
+        self.recent_signals = self.recent_signals[-100:]
+
+# In get_recent_signals:
+with self._signal_lock:
+    return list(reversed(self.recent_signals[-limit:]))
+```
+
+### 3. **WebSocket Reconnection Logic: Exponential Backoff Reset Bug** [MEDIUM-HIGH]
+**Location**: `src/blockchain_monitor.py:_connect_and_subscribe()` (lines 115-125)
+
+**The Bug**: The reconnection delay is reset to 1 second (`self._reconnect_delay = 1`) immediately upon successful connection. However, if the connection drops within seconds (e.g., rate limit), the backoff starts at 1s again—creating a **reconnection storm** that can trigger API bans.
+
+**Impact**: Alchemy/Infura free tier rate limits (typically 100 req/s) can be exhausted, causing IP bans or account suspension.
+
+**Exact Fix**:
+```python
+def _connect_and_subscribe(self):
+    print("[BLOCKCHAIN] Connecting to Polygon RPC...")
+    
+    if not self.web3.is_connected():
+        raise ConnectionError("Failed to connect to Polygon RPC")
+    
+    self.connected = True
+    # Only reset backoff after sustained connection (e.g., 30s uptime)
+    if hasattr(self, '_connected_since') and time.time() - self._connected_since > 30:
+        self._reconnect_delay = 1
+    self._connected_since = time.time()
+```
+
+### 4. **Price Calculation Bug in Blockchain Monitor** [HIGH]
+**Location**: `src/blockchain_monitor.py:_process_order_filled()` (lines 160-180)
+
+**The Bug**: The price calculation logic is **mathematically incorrect**:
+```python
+if whale_side == "maker":
+    whale_price = float(taker_amount) / float(maker_amount) if maker_amount > 0 else 0
+else:
+    whale_price = float(taker_amount) / float(maker_amount) if maker_amount > 0 else 0
+```
+
+Both branches calculate `taker_amount / maker_amount`, but this is wrong:
+- If whale is **maker**: They sold `makerAmount` of token A, received `takerAmount` of token B. Price = what they paid per unit received = `makerAmount / takerAmount`.
+- If whale is **taker**: They sold `takerAmount` of token B, received `makerAmount` of token A. Price = what they paid per unit received = `takerAmount / makerAmount`.
+
+**Impact**: All blockchain-derived prices are **inverted** (e.g., 0.60 becomes 1.67). This breaks Winner's Curse protection, Kelly sizing, and all downstream logic.
+
+**Exact Fix**:
+```python
+if whale_side == "maker":
+    # Maker sold makerAmount, received takerAmount
+    # Price in terms of what they bought: cost per share = makerAmount / takerAmount
+    whale_price = float(maker_amount) / float(taker_amount) if taker_amount > 0 else 0
+else:
+    # Taker sold takerAmount, received makerAmount  
+    # Price = takerAmount / makerAmount (what they paid per share received)
+    whale_price = float(taker_amount) / float(maker_amount) if maker_amount > 0 else 0
+```
+
+### 5. **Missing Gas Price Fetch Error Handling** [MEDIUM]
+**Location**: `src/blockchain_monitor.py:_process_order_filled()` (lines 200-210)
+
+**The Bug**: The code attempts to fetch `tx_receipt` using `self.web3.eth.get_transaction()` which is a **blocking call** with no timeout. If the RPC hangs, the entire monitor thread stalls indefinitely.
+
+**Impact**: Monitor thread deadlock; no new signals processed; bot appears "alive" but is blind.
+
+**Exact Fix**:
+```python
+# Use a timeout wrapper or async pattern
+try:
+    # web3.py doesn't support timeouts directly, use threading
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(self.web3.eth.get_transaction, event['transactionHash'])
+        tx_receipt = future.result(timeout=5)  # 5 second timeout
+    gas_price_wei = tx_receipt.get('gasPrice', 0)
+except concurrent.futures.TimeoutError:
+    gas_price_wei = 0
+except Exception:
+    gas_price_wei = 0
+```
+
+---
+
+## C) EDGE ANALYSIS: Copy Trading Breakeven Math
+
+### Fee Structure Verification
+The curved fee formula in `src/paper_fees.py` is **correct**:
+```python
+fee_per_unit = (fee_rate_bps / 10000.0) * price * (1.0 - price)
+```
+This matches Polymarket's documentation: fees are highest at 0.50 (mid-price) and zero at 0.00/1.00.
+
+### Stress Simulator Constants Review
+From `src/stress_sim.py`, the baseline friction is:
+- `SLIPPAGE_BASE = 0.015` (1.5%)
+- `FILL_REJECTION_BASE = 0.08` (8% rejection)
+- `STALENESS_PER_SEC = 0.001` (0.1% per second)
+- `GAS_FEE_MAX = 0.008` (0.8¢ per trade)
+
+### Breakeven Calculation
+
+**Scenario**: Copying a whale at price $0.55, signal age 30 seconds, score=3 (crowd effect), fast market.
+
+**Entry Costs**:
+- Base slippage: 1.5%
+- Random noise: avg 1.25% (uniform 0-2.5%)
+- Timing drift: avg 1.5% (uniform 0-3%)
+- Staleness (30s): 30 × 0.1% = 3.0%
+- Crowd (score≥4): 2.0%
+- **Total slippage**: ~9.25%
+- **Adjusted entry**: $0.55 × 1.0925 = $0.601
+
+**Exit Costs** (assuming whale exits at same price):
+- Base slippage: 1.5%
+- Random noise: 1.25%
+- Timing drift: 1.5%
+- **Total exit slippage**: ~4.25%
+- **Adjusted exit**: $0.55 × 0.9575 = $0.527
+
+**Round-Trip Cost**:
+- Entry: $0.601
+- Exit: $0.527  
+- **Loss per $1 traded**: $0.074 (7.4%)
+
+**Required Win Rate**:
+To breakeven with 7.4% friction on a $0.55 entry (potential win $0.445, potential loss $0.601):
+```
+Expected Value = p × (1 - 0.601) - (1-p) × 0.601 = 0
+p × 0.399 - 0.601 + p × 0.601 = 0
+p × 1.0 = 0.601
+p = 60.1%
+```
+
+**Conclusion**: The stress simulator requires a **60.1% win rate** to breakeven on a typical $0.55 entry. This is **realistic but demanding**—most prediction market traders have 50-55% win rates. The bot's edge must come from **superior whale selection** (the Bayesian scoring + category filtering).
+
+### Is the Stress Sim TOO Pessimistic?
+
+**YES, in some ways**:
+1. **Crowd slippage assumes all high-score signals attract copiers**—but with only $100 starting capital, the bot's own trades don't move the market
+2. **Staleness penalty caps at 5%**—but with blockchain monitor (2-3s latency), signals are rarely >10s old, so 3% staleness is more realistic than 5%
+3. **Partial fills at 35-85%**—Polymarket's CLOB typically has better depth for small ($1-10) orders
+
+**NO, in other ways**:
+1. **Gas fees are UNDERESTIMATED**—Polygon can spike to 500+ gwei during congestion, making $0.008 optimistic
+2. **No modeling of "toxic flow"**—if whales are informed, the bot is systematically entering against adverse selection
+3. **Winner's Curse at 8%**—if the whale got a good fill, the bot's 8% worse entry may be too generous
+
+**Net Assessment**: The stress sim is **appropriately conservative** for paper trading. Real performance will likely be 10-20% better than paper, creating a safety margin.
+
+---
+
+## D) RISK & FAILURE MODE REVIEW
+
+### Top 10 Ways the System Can Fail
+
+| Rank | Failure Mode | Mitigated? | Severity |
+|------|-------------|------------|----------|
+| 1 | **Duplicate trades** via blockchain+polling dual path | **NO** (Critical bug found) | HIGH |
+| 2 | **Inverted prices** from blockchain monitor | **NO** (Math bug found) | HIGH |
+| 3 | **Race condition crash** in signal list mutation | **NO** (No locks) | HIGH |
+| 4 | **Reconnection storm** triggering API ban | **PARTIAL** (Backoff exists but flawed) | MEDIUM |
+| 5 | **State corruption** on crash mid-write | **PARTIAL** (Atomic writes, no CRC) | MEDIUM |
+| 6 | **Whale correlation blow-up** (all whales wrong same time) | **PARTIAL** (Category scoring helps) | MEDIUM |
+| 7 | **API degradation** during exit (stuck positions) | **NO** (No retry logic for exits) | MEDIUM |
+| 8 | **Time sync drift** affecting expiry parsing | **NO** (No NTP check) | LOW |
+| 9 | **Log bloat** filling MacBook disk | **NO** (No rotation) | LOW |
+| 10 | **MacBook sleep** killing the process | **NO** (No caffeinate integration) | LOW |
+
+### Suggested Kill-Switch Improvements
+
+1. **Add blockchain monitor circuit breaker**: If >5 reconnections in 60 seconds, disable monitor and fall back to polling
+2. **Add price sanity check**: If `whale_price` from blockchain differs >20% from API-fetched price, reject signal (catches inversion bug)
+3. **Add daily trade limit**: Hard cap at 50 trades/day to prevent runaway duplication
+
+---
+
+## E) PAPER-TO-LIVE GAP
+
+### Where Paper is Faithful
+- **Fee calculation**: Curved formula matches Polymarket exactly
+- **Slippage modeling**: Conservative and comprehensive
+- **Settlement logic**: Binary outcome ($0 or $1) is deterministic
+- **Gas costs**: Reasonable for Polygon (though can spike higher)
+
+### Where Paper is Optimistic
+1. **Fill probability**: Paper assumes 92% fill rate (`FILL_REJECTION_BASE=0.08`), but live CLOB may reject more during volatility
+2. **No MEV**: Paper doesn't model sandwich attacks or front-running (though small size makes this unlikely)
+3. **API latency**: Paper assumes instant API responses; real-world latency can add 500ms-2s to signal age
+4. **No partial settlement risk**: Paper assumes markets resolve correctly; real markets can be disputed or delayed
+
+### Where Paper is Pessimistic
+1. **Crowd slippage**: Overestimates impact of other copy traders (small capital = no market impact)
+2. **Partial fills**: 35% minimum fill is very conservative for small orders
+3. **Off-hours penalty**: 40% worse slippage may not apply to 24/7 crypto markets
+
+### Validation Steps Required Before Live
+1. **Shadow mode**: Run bot in paper mode alongside live CLOB for 2 weeks, compare fill prices
+2. **Price sanity checks**: Log every `whale_price` vs actual book midpoint at detection time
+3. **Latency measurement**: Log API response times to calibrate `TIMING_DRIFT_MAX`
+4. **Gas spike testing**: Monitor gas costs during high congestion periods
+
+---
+
+## F) SCALING ASSESSMENT
+
+### $100 → $500
+- **No changes needed**: Current `RISK_PER_TRADE_PCT=0.01` (1%) = $1-5 trades, well within liquidity
+- **Stress sim remains accurate**: Small size doesn't move books
+
+### $500 → $2,000
+- **Risk**: `copy_max` capped at `balance * max_trade_pct * growth_mult` = $2k × 0.03 × 1.25 = $75 max per trade
+- **Liquidity constraint**: $75 orders may start getting partial fills in thin markets (<$10k liquidity)
+- **Recommendation**: Add `MIN_BOOK_DEPTH_USDC` check before execution
+
+### $2,000 → $5,000+
+- **Major risk**: Copying whales with $500+ positions will move prices in small markets
+- **Correlation risk**: With $5k, the bot becomes a significant portion of whale's own position—if whale is wrong, bot can't exit without massive slippage
+- **Recommendation**: 
+  - Cap individual trade size at $100 (absolute, not percentage)
+  - Add "whale position size ratio" check: don't copy if whale's position >5% of book depth
+  - Stop scaling at $5,000 until proven profitable over 3+ months
+
+### Arb Scanner Scaling
+- **Current status**: DISABLED (`ENABLE_ARB_SCANNER=False`)
+- **If re-enabled**: Arb opportunities disappear quickly; scaling beyond $500 makes two-leg fills impossible
+- **Recommendation**: Keep disabled unless running on dedicated HFT infrastructure (not MacBook)
+
+---
+
+## G) ARCHITECTURE & OPS GRADE
+
+### Code Quality: B+
+**Strengths**:
+- Comprehensive stress simulation
+- Good separation of concerns (whale_tracker vs wallet_scorer vs paper_engine)
+- Atomic state writes with `os.replace()`
+- Bayesian scoring for regularization
+
+**Weaknesses**:
+- Missing locks for thread-shared state
+- No schema versioning in JSON files
+- Some magic numbers (e.g., `50000` seen_tx trim limit) without comments
+- Inconsistent error handling (some places catch Exception, others don't)
+
+### Production Readiness Score: 62/100
+
+**Breakdown**:
+- Core logic: 85/100 (solid math, good risk management)
+- Concurrency: 35/100 (race conditions, no locks)
+- Error handling: 55/100 (incomplete, missing timeouts)
+- Observability: 70/100 (good logging, basic Telegram)
+- State management: 75/100 (atomic writes, no CRC)
+
+### Operational Checklist for 24/7 MacBook
+
+**Sleep Prevention**:
+```bash
+# Add to run.sh before starting bot
+caffeinate -d -i -s -u &  # Prevent sleep on lid close, disk idle, system sleep
+CAFFEINATE_PID=$!
+trap "kill $CAFFEINATE_PID" EXIT
+```
+
+**Log Rotation** (missing):
+```python
+# Add to bot.py startup
+import logging
+from logging.handlers import RotatingFileHandler
+handler = RotatingFileHandler('logs/bot.log', maxBytes=10*1024*1024, backupCount=5)
+```
+
+**State Backup** (missing):
+```python
+# Add to _save_state methods
+import shutil
+shutil.copy2(STATE_FILE, STATE_FILE + ".backup")
+```
+
+**Time Sync Check** (missing):
+```python
+# Add to health check
+import ntplib
+def check_time_sync():
+    try:
+        client = ntplib.NTPClient()
+        response = client.request('pool.ntp.org')
+        offset = response.offset
+        if abs(offset) > 5:
+            print(f"[HEALTH] WARNING: Time drift {offset}s detected")
+    except:
+        pass
+```
+
+---
+
+## H) BRUTAL HONESTY TAKE
+
+### Is This Likely to Make Money?
+
+**Maybe, but the edge is thinner than the code suggests.**
+
+The bot's core thesis—copying profitable whales with 2-3s latency—is **sound in theory**. However:
+
+1. **Adverse Selection**: The whales being copied are already profitable. If they're selling, who is buying? The bot becomes the counterparty to informed flow.
+2. **Fee Drag**: At 60%+ breakeven win rate requirement, the margin for error is razor-thin. One bad week of whale performance wipes out months of gains.
+3. **Survivorship Bias**: The leaderboard shows winners from the past month, not predictors of next month. Crypto markets regime-shift constantly.
+
+**Probability of Profitability (6 months)**:
+- Optimistic: 35% (whales stay hot, stress sim is too pessimistic)
+- Realistic: 20% (breakeven after fees, small loss from adverse selection)
+- Pessimistic: 10% (whales revert to mean, bot pays fees+slippage)
+
+### Would I Run This With My Own $5,000?
+
+**Only under strict conditions**:
+1. **Fix the 4 HIGH severity bugs above first** (especially price inversion)
+2. **Run paper for 4 weeks minimum**, verify simulated PnL matches theoretical edge
+3. **Start with $500 live**, scale up only after 2 months of profit
+4. **Daily manual review** of all trades for first month (don't trust automation blindly)
+5. **Hard stop-loss**: If down 20% ($100), shut down and reassess
+
+### The Single Biggest Flaw
+
+**The blockchain monitor's price inversion bug** (Issue #4) would cause immediate catastrophic losses if deployed live. Every blockchain-derived signal would trigger trades at inverted prices—buying high instead of low, selling low instead of high. This is a **money-incinerating bug** that must be fixed before any live trading.
+
+The second biggest flaw is the **race condition in signal deduplication** (Issue #1)—this could cause the bot to double or triple exposure on the same trade, blowing through risk limits.
+
+---
+
+## VERIFICATION OF V11 FIXES
+
+| Fix | Location | Status | Verification |
+|-----|----------|--------|--------------|
+| Fee calculation | `paper_fees.py:calculate_trading_fee()` | ✅ **CORRECT** | Uses curved formula `fee = (bps/10000) * price * (1-price)` |
+| Staleness measurement | `paper_engine.py:execute_copy_trade()` line ~427 | ✅ **CORRECT** | Uses `signal.get("timestamp", signal.get("detected_at"))` |
+| Exposure persistence | `risk.py:_save_state()` / `_load_state()` | ✅ **CORRECT** | Atomic writes with `os.replace()`, loads on init |
+| Arb scanner disabled | `bot.py:ENABLE_ARB_SCANNER` check | ✅ **CORRECT** | Wrapped in `if config.get("ENABLE_ARB_SCANNER", False)` |
+
+All v11 fixes are **verified correct** in the code.
+
+---
+
+## FINAL RECOMMENDATION
+
+**DO NOT DEPLOY LIVE** until:
+1. Fix price inversion in blockchain monitor (Issue #4)
+2. Add deduplication to blockchain signals (Issue #1)
+3. Add thread locks to shared state (Issue #2)
+4. Run paper mode for 2+ weeks with blockchain monitor enabled
+5. Verify no duplicate trades in logs
+
+The architecture is **sound but the v12 implementation has critical bugs**. The stress simulation is excellent, the risk management is thoughtful, and the whale selection logic is sophisticated. But the blockchain integration was rushed and needs hardening.
+
+**Treat this like real money—because once you flip to LIVE, it is.**

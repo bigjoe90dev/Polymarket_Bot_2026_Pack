@@ -2,9 +2,13 @@ import os
 import json
 import getpass
 import uuid
+from dotenv import load_dotenv
+
+# Load secrets from .env file (never committed to git)
+load_dotenv()
 
 CONFIG_PATH = "config/config.json"
-CONFIG_VERSION = 12  # v12: Real-time blockchain monitoring (2-3s latency vs 5-12min polling)
+CONFIG_VERSION = 14  # v14: Production hardening (metrics, parity, health monitoring, backup rotation)
 
 
 def load_or_create_config():
@@ -72,6 +76,47 @@ def load_or_create_config():
         print("    - Requires Alchemy/Infura WebSocket URL in POLYGON_RPC_WSS")
         print("    - Get free WSS URL: https://dashboard.alchemy.com/apps")
 
+    # v13: Critical bug fixes from 4 LLM auditors (Gemini, Kimi, GPT, Grok)
+    if config.get("_config_version", 0) < 13:
+        config["_config_version"] = 13
+        # No new config fields in v13, just bug fixes:
+        # - Blockchain signals now execute (thread-safe queue + bot.py wiring)
+        # - Price inversion fixed (maker/taker calc)
+        # - Thread safety (locks + Queue)
+        # - WebSocket backfill on reconnect
+        # - Block timestamps for whale trades
+        # - Gas fetch timeout
+        # - Address normalization
+        dirty = True
+        print("[*] Config v13 — CRITICAL BUG FIXES:")
+        print("    - Blockchain signals now execute (was: logged but never traded)")
+        print("    - Price calculation fixed (was: inverted)")
+        print("    - Thread safety (locks for shared state)")
+        print("    - WebSocket reconnect now backfills missed events")
+        print("    - Timestamps use block time (not detection time)")
+
+    # v14: Production hardening (metrics, parity, health monitoring, backup rotation)
+    if config.get("_config_version", 0) < 14:
+        config["_config_version"] = 14
+        # Production monitoring and safety features
+        config["METRICS_LOGGING_ENABLED"] = True        # CSV/JSON structured metrics
+        config["METRICS_LOG_INTERVAL_SEC"] = 60         # Log metrics every 60s
+        config["PARITY_CHECK_ENABLED"] = True           # Validate blockchain decode accuracy
+        config["HEALTH_MONITOR_ENABLED"] = True         # Auto-recovery and watchdogs
+        config["HEALTH_CHECK_INTERVAL_SEC"] = 30        # Health checks every 30s
+        config["MIN_BLOCKCHAIN_CONFIRMATIONS"] = 0      # Reorg protection (0 = instant, 5 = safe)
+        config["MAX_PRICE_CHASE_PCT"] = 0.05            # Max 5% price chase vs whale entry
+        config["STATE_BACKUP_GENERATIONS"] = 5          # Keep last 5 state file backups
+        dirty = True
+        print("[*] Config v14 — PRODUCTION HARDENING:")
+        print("    - Metrics logging: CSV/JSON time-series for analysis")
+        print("    - Parity checking: Validate blockchain decode accuracy (>95% target)")
+        print("    - Health monitoring: Auto-recovery from stalls and corruption")
+        print("    - Backup rotation: 5-generation state file backups with auto-recovery")
+        print("    - Reorg protection: Wait for confirmations before processing events")
+        print("    - Execution controls: Max 5% price chase limit vs whale entry")
+        print("    - Fee classification: Crypto 10%, sports/politics 0%, fallback 2%")
+
     # Select mode FIRST so we know whether credentials are needed
     if "MODE" not in config:
         print("\nSelect Mode:")
@@ -81,6 +126,24 @@ def load_or_create_config():
         sel = input("Choice [1]: ").strip() or "1"
         config["MODE"] = {"1": "PAPER", "2": "SHADOW", "3": "LIVE"}.get(sel, "PAPER")
         dirty = True
+
+    # Load secrets from environment variables (fallback to .env via python-dotenv)
+    # This allows secrets to be stored in .env without committing to git
+    env_mappings = {
+        "POLYGON_RPC_WSS": "POLYGON_RPC_WSS",
+        "POLY_API_KEY": "POLY_API_KEY",
+        "POLY_SECRET": "POLY_SECRET",
+        "POLY_PASSPHRASE": "POLY_PASSPHRASE",
+        "TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID": "TELEGRAM_CHAT_ID",
+        "DASHBOARD_TOKEN": "DASHBOARD_TOKEN",
+    }
+    
+    for config_key, env_key in env_mappings.items():
+        # Only use env var if config doesn't have a value
+        if not config.get(config_key) and os.environ.get(env_key):
+            config[config_key] = os.environ.get(env_key)
+            dirty = True
 
     # Polygon RPC WebSocket URL (for blockchain monitoring)
     if config.get("USE_BLOCKCHAIN_MONITOR", False) and not config.get("POLYGON_RPC_WSS"):

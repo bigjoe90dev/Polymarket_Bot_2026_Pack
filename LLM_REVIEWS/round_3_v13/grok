@@ -1,0 +1,57 @@
+# Polymarket Copy Trading Bot - v12 Technical Audit
+
+## A. Executive Summary
+The v12 implementation represents a significant upgrade with real-time blockchain monitoring, achieving low-latency whale detection that positions the bot competitively against HFT-style copiers. While v11 fixes appear correctly implemented in the code (e.g., curved fee formula matches Polymarket's structure for fee-enabled markets), several new issues in the blockchain integration—such as potential event misses during reconnections and inaccurate timestamps—could undermine the edge. Overall, the system is production-ready for paper trading but requires fixes for live deployment; biggest strength is the event-driven architecture, biggest risk is state persistence gaps in RiskGuard, recommended next step is adding RiskGuard persistence and block timestamp fetching.
+
+## B. Critical Issues (Must Fix Before Live Trading)
+- **Severity: High** | Location: src/blockchain_monitor.py: _connect_and_subscribe (event_filter creation)  
+  Explanation: WebSocket reconnection creates a new event filter from "latest" block, but events during downtime (e.g., 1-60s backoff) are missed since filters don't backfill historical events post-disconnect. This could skip whale trades, especially in volatile periods.  
+  Suggested fix: On reconnect, create filter from last known block (self.last_block) instead of "latest"; fetch missed events using get_all_entries() or poll logs for the gap.
+
+- **Severity: High** | Location: src/blockchain_monitor.py: _process_order_filled (signal_data["timestamp"])  
+  Explanation: Uses time.time() for whale timestamp, ignoring actual block timestamp. This underestimates staleness (user's v11 fix aimed at accurate whale vs detection time); in fast markets, 2-3s block time + processing could lead to stale entries.  
+  Suggested fix: Fetch block timestamp via self.web3.eth.get_block(event['blockNumber'])['timestamp']; use that for "timestamp", time.time() for "detected_at".
+
+- **Severity: High** | Location: src/risk.py (entire module)  
+  Explanation: No state persistence for current_exposure or daily_loss; on restart, resets to 0, allowing over-exposure. User claims v11 fixed this, but code shows in-memory only—no save/load.  
+  Suggested fix: Add JSON persistence similar to paper_engine.py; load in __init__, save on updates. Use atomic writes with tmp file.
+
+- **Severity: Medium** | Location: src/blockchain_monitor.py: update_tracked_wallets and _process_order_filled  
+  Explanation: No locking around tracked_wallets set; if update_tracked_wallets called during event processing (multi-threaded), could raise RuntimeError on dict resize. Python GIL mitigates but not guarantees safety.  
+  Suggested fix: Use self._lock = threading.Lock(); with self._lock: in both methods.
+
+- **Severity: Medium** | Location: src/blockchain_monitor.py: _fetch_market_from_token_id  
+  Explanation: Function is incomplete in code (cuts off at API endpoint comment); if not implemented, market_data fetch fails, skipping signals. Assuming it's meant to use Polymarket API, but truncation suggests copy-paste error or unfinished.  
+  Suggested fix: Complete with requests to https://clob.polymarket.com/markets?token_id={token_id_hex} or similar; handle errors gracefully.
+
+- **Severity: Low** | Location: src/paper_engine.py: execute_copy_trade (wallet_mult calculation)  
+  Explanation: wallet_mult falls back to 1.0 if scorer missing, but if scorer present and wallet_mult <=0, skips trade—good. However, no logging for skips, hard to debug cutoffs.  
+  Suggested fix: Add print or log_decision for "Wallet cut off" reason.
+
+- **Severity: Low** | Location: src/bot.py: run (arb scanning batch)  
+  Explanation: Arb scanner enabled despite user's claim of disable in v11 (negative EV). If truly negative, wastes cycles; but with blockchain, perhaps viable for fast signals.  
+  Suggested fix: Add config flag to toggle; calculate EV in check_opportunity to skip if <0.
+
+## C. Edge Analysis
+Breakeven whale edge: Assuming 2% fees+slippage (base from stress sim + Polymarket taker fees on fast markets), half-Kelly sizing (50% aggressive), and 2-3s latency (adds ~1-2% extra slippage in 15-min markets per stress sim). Required whale win rate for breakeven is ~55-60% at 1.5:1 reward:risk (from dynamic TP/SL). With Bayesian scoring (Beta(2,2) prior sound, prevents overfitting small samples) + category segmentation (strong: avoids cross-domain bleed), actual edge could hit 65% selected win rate, yielding 5-10% monthly ROI post-friction if whale pool maintains quality. Probability of profitability over 6 months: 70% if stress sim holds, but drops to 40% if network discovery adds noisy wallets (survivorship bias in leaderboard).
+
+## D. Scaling Assessment
+At $1k: No issues; small positions ($10-30) get full fills on most books.  
+At $5k: Minor slippage increase (1-2% extra on thin markets <$50k liquidity); cap sizes to 5% of book depth.  
+At $10k: Book impact noticeable; $100+ trades widen spreads 2-5% on low-liq markets—switch to limit orders for maker rebates (saves 0.5-1%).  
+At $50k: Breaks on capacity; many markets <$100k total liq, can't deploy without multi-leg splits or waiting for replenishment. Recommend whale threshold raise to $50k+ PNL/month; add cross-market arb for capital efficiency.
+
+## E. Architecture Review
+Code quality grade: B (clean module split, but circular deps like paper_engine importing risk; paper engine too coupled to execution).  
+Production readiness: 75% (atomic state in paper_engine solid, but risk lacks it; threading safe mostly, but add locks for wallets).  
+Specific improvements: Add WAL for state (e.g., append-only log before JSON); memory: trade_history caps at 1000, good—no leaks; monitoring: heartbeat exists, add email/SMS on timeout.
+
+## F. Missing Features (Priority-Ranked)
+1. **Settlement automation** (High impact: handle manual resolutions/disputes; flag ambiguous markets via keyword scan).  
+2. **Limit order support** (Medium: maker rebates save fees at scale; better fills).  
+3. **News sentiment signals** (Medium: filter whale trades against sentiment for edge boost).  
+4. **Portfolio rebalancing** (Low: auto-exit correlated positions to cut tail risk).  
+5. **Technical analysis** (Low: simple MA crossovers for exit timing, but low edge in predictions).
+
+## G. Honest Take
+If this were my $5,000, I'd deploy in shadow mode for 2 weeks to validate signals, then live with 20% allocation—system has edge via blockchain speed, but persistence bugs + event misses could wipe gains on restart. Single biggest flaw: no risk persistence, turning restarts into over-leverage disasters. Fix that + timestamps, and it's viable.

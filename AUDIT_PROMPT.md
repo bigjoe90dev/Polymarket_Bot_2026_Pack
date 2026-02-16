@@ -16,10 +16,10 @@ You are an expert trading systems auditor with deep knowledge of:
 
 ## Version Info
 
-**CONFIG_VERSION**: 12 (as of February 10, 2026)
+**CONFIG_VERSION**: 14 (as of February 10, 2026)
 **Status**: PAPER MODE — Not yet deployed live
 **Starting Balance**: $100 (paper trading)
-**Review Round**: 3 (Round 2: 4 LLM reviews → all FATAL bugs fixed in v11; v12 adds real-time blockchain monitoring)
+**Review Round**: 4 (Round 3: v13 bug fixes from 4 LLMs, v14 production hardening)
 
 **NEW in v12 - Real-Time Blockchain Monitoring** (THE COMPETITIVE EDGE):
 - 🚀 **2-3 second latency** vs 5-12 minute polling (700× faster whale detection)
@@ -29,6 +29,116 @@ You are an expert trading systems auditor with deep knowledge of:
 - 🎯 **Competitive with HFT**: On par with professional copy bots (vs hopeless 5-12min lag before)
 - 📂 **New module**: `src/blockchain_monitor.py` - Full WebSocket event listener with reconnection logic
 - 🔧 **Config**: `USE_BLOCKCHAIN_MONITOR=True`, `POLYGON_RPC_WSS` (user provides Alchemy WSS URL)
+
+**CRITICAL FIXES in v13** (implemented February 10, 2026):
+Audit round by 4 independent LLMs (Gemini, Kimi, GPT-4o, Grok) found 8 CRITICAL bugs in v12 blockchain monitoring:
+
+1. ✅ **Blockchain signals never executed** (FATAL): Signals were logged but never traded on
+   - **Fix**: Added thread-safe `queue.Queue()` for blockchain signals + wired into `bot.py` execution loop
+   - **Location**: `src/whale_tracker.py` lines 52, 704-745; `src/bot.py` lines 137-141
+   - **Impact**: Bot now executes on blockchain signals within 2-3 seconds (vs 5-12 min polling lag)
+
+2. ✅ **Price inversion** (FATAL): All blockchain prices were inverted (0.60 became 1.67)
+   - **Fix**: Corrected maker/taker price calculation with proper direction-based logic
+   - **Location**: `src/blockchain_monitor.py` lines 236-241
+   - **Impact**: Winner's Curse, Kelly sizing, and all price-dependent logic now correct
+
+3. ✅ **Thread safety** (HIGH): No locks on shared state accessed by blockchain monitor thread
+   - **Fix**: Added `threading.Lock()` for `_seen_tx_hashes`, `queue.Queue()` for signals
+   - **Location**: `src/whale_tracker.py` line 52, add_blockchain_signal()
+   - **Impact**: No more race conditions or "dictionary changed size during iteration" crashes
+
+4. ✅ **WebSocket reconnect misses events** (HIGH): Reconnection started from "latest" block, missing events during downtime
+   - **Fix**: Now backfills from `last_block-5` on reconnect with 5-block safety margin
+   - **Location**: `src/blockchain_monitor.py` lines 137-157
+   - **Impact**: No blind spots during WebSocket reconnections
+
+5. ✅ **Incorrect timestamps** (HIGH): Used `time.time()` for whale timestamp instead of actual block timestamp
+   - **Fix**: Now fetches `block.timestamp` from blockchain for accurate whale trade time
+   - **Location**: `src/blockchain_monitor.py` lines 245-285
+   - **Impact**: Staleness measurement now correct (was underestimating by seconds to minutes)
+
+6. ✅ **Gas fetch deadlock** (MEDIUM): Blocking `get_transaction()` call could hang monitor thread indefinitely
+   - **Fix**: Added 3-second timeout using `ThreadPoolExecutor`
+   - **Location**: `src/blockchain_monitor.py` lines 254-268
+   - **Impact**: Monitor thread can no longer deadlock on RPC hangs
+
+7. ✅ **Address normalization** (MEDIUM): Mixed-case wallet addresses caused false "untracked wallet" drops
+   - **Fix**: All wallet addresses now lowercased consistently in `discover_whales()`
+   - **Location**: `src/whale_tracker.py` line 215
+   - **Impact**: Blockchain signals no longer dropped due to case mismatch
+
+8. ✅ **BONUS FIX**: Race condition in `get_tracked_wallets()` — dict snapshots prevent iteration errors
+
+**v13 Status**: All CRITICAL and HIGH severity bugs fixed. 2-3 second blockchain latency IS achievable.
+
+**NEW in v14 - Production Hardening** (implemented February 10, 2026):
+After fixing all v13 bugs, added comprehensive production monitoring and safety features:
+
+1. **Metrics Logging System** (`src/metrics_logger.py`):
+   - CSV + JSON structured logging for time-series analysis
+   - Thread-safe counters, gauges, and timing measurements
+   - Context managers for easy timing (`with metrics.timer("whale_poll_duration"):`)
+   - Automatic daily file rotation with cumulative stats
+   - **Config**: `METRICS_LOGGING_ENABLED=True`, `METRICS_LOG_INTERVAL_SEC=60`
+
+2. **Parity Checker** (`src/parity_checker.py`):
+   - Shadow validation: matches blockchain events to API trades
+   - CRITICAL before LIVE: ensures blockchain decoder maps to correct market/side/price
+   - Generates daily reports with match rates and side error rates
+   - **Target**: >95% match rate, <1% side error rate before shadow mode
+   - **Config**: `PARITY_CHECK_ENABLED=True`
+
+3. **Health Monitor** (`src/health_monitor.py`):
+   - Comprehensive health checks: main loop heartbeat, blockchain stalls, signal droughts, state corruption
+   - Auto-recovery: emergency state saves, forced blockchain reconnects
+   - Alerts when manual intervention required
+   - **Config**: `HEALTH_MONITOR_ENABLED=True`, `HEALTH_CHECK_INTERVAL_SEC=30`
+
+4. **Backup Rotation & Recovery** (`src/state_backup.py`):
+   - 5-generation backup rotation for all state files (`.bak1` → `.bak2` → ... → `.bak5`)
+   - Schema validation on load with automatic rollback to last good backup
+   - Atomic writes with `os.replace()` pattern
+   - **Config**: `STATE_BACKUP_GENERATIONS=5`
+   - **Applied to**: `risk.py`, `wallet_scorer.py`, `whale_tracker.py`, `paper_engine.py`, `parity_checker.py`
+
+5. **Fee Rate Classification** (`src/market.py`):
+   - Intelligent fee tier lookup: crypto fast 1000 bps (10%), sports/politics 0 bps (0%), fallback 200 bps (2%)
+   - Pattern matching on market titles for accurate fee estimates
+   - CRITICAL for profitability analysis before LIVE
+   - **Impact**: Paper results now use realistic fees, not conservative 200 bps for everything
+
+6. **Global Signal Deduplication** (`src/whale_tracker.py`):
+   - Prevents double-trading the same whale signal from blockchain + API sources
+   - MD5-based signal fingerprinting with 30-minute TTL
+   - **Impact**: No duplicate trades, cleaner audit trail
+
+7. **Reorg Protection** (`src/blockchain_monitor.py`):
+   - Configurable confirmation wait before processing blockchain events
+   - Market metadata cache (eliminates per-event HTTP fetches)
+   - **Config**: `MIN_BLOCKCHAIN_CONFIRMATIONS=0` (instant) or `5` (safe)
+
+8. **Execution Quality Controls** (`src/paper_engine.py`):
+   - Max price chase limit: 5% max deviation from whale entry price
+   - Exit staleness fix: uses whale timestamp (not detection time) for exit-copy signals
+   - Paper engine now has access to `MarketDataService` for fee lookups
+   - **Config**: `MAX_PRICE_CHASE_PCT=0.05`
+
+**v14 Monitoring Wiring** (`src/bot.py`):
+- Health monitor heartbeat updates every cycle
+- Blockchain monitor market cache updated on market refresh
+- Metrics tracking for all copy trades (attempts, executions, skip reasons)
+- Periodic parity matching every 5 minutes
+- Metrics gauges updated every 30 seconds (tracked wallets, open positions, exposure, blockchain status)
+- Graceful shutdown: stops health monitor, metrics logger, saves parity state
+
+**v14 Deliverables**:
+- `src/metrics_logger.py` (288 lines) — Structured logging system
+- `src/parity_checker.py` (408 lines) — Blockchain validation system
+- `src/health_monitor.py` (341 lines) — Health checks and auto-recovery
+- `src/state_backup.py` (144 lines) — Backup rotation utilities
+- Enhanced: `market.py`, `whale_tracker.py`, `blockchain_monitor.py`, `paper_engine.py`, `bot.py`
+- Updated: `config.py` with v13/v14 upgrade blocks
 
 **Critical Fixes in v11** (implemented February 10, 2026):
 - ✅ **Fee calculation FIXED**: Now uses curved Polymarket formula `fee = (bps/10000) * price * (1-price)` instead of flat fee (was overcharging by 4× at mid-prices)

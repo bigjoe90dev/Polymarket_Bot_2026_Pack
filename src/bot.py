@@ -11,6 +11,11 @@ from src.whale_tracker import WhaleTracker
 from src.wallet_scorer import WalletScorer
 from src.notifier import TelegramNotifier
 from src.blockchain_monitor import BlockchainMonitor
+from src.clob_websocket import CLOBWebSocketMonitor
+from src.momentum_strategy import MomentumStrategy
+from src.metrics_logger import MetricsLogger
+from src.parity_checker import ParityChecker
+from src.health_monitor import HealthMonitor
 
 # Free-infra speed constants (overridable via config)
 DEFAULT_MARKETS_PER_CYCLE = 20   # Order books fetched per cycle
@@ -58,6 +63,31 @@ class TradingBot:
             self.blockchain_monitor = BlockchainMonitor(config, on_whale_trade)
             print("[*] Blockchain monitor initialized (will start after whale discovery)")
 
+        # CLOB WebSocket monitor for ultra-low latency whale trades (~300ms vs 2-3s blockchain)
+        self.clob_websocket = None
+        if config.get("USE_CLOB_WEBSOCKET", False):
+            def on_clob_trade(signal_data):
+                """Callback when CLOB WebSocket detects whale trade."""
+                self.whale_tracker.add_clob_signal(signal_data)
+
+            self.clob_websocket = CLOBWebSocketMonitor(config, on_clob_trade)
+            print("[*] CLOB WebSocket monitor initialized (will start after whale discovery)")
+            
+            # Momentum strategy for CLOB-based pattern trading
+            self.momentum_strategy = MomentumStrategy(
+                paper_engine=self.execution.paper_engine,
+                lookback_seconds=config.get("MOMENTUM_LOOKBACK", 60),
+                min_momentum=config.get("MOMENTUM_THRESHOLD", 0.02),
+                position_size=config.get("MOMENTUM_SIZE", 5.0),
+            )
+            print("[*] Momentum strategy initialized (CLOB pattern trading)")
+            
+            # Register momentum callback with CLOB websocket
+            def momentum_callback(token_id, price):
+                self.momentum_strategy.on_price_update(token_id, price)
+            
+            self.clob_websocket.price_callback = momentum_callback
+
         # Telegram notifications
         self.notifier = TelegramNotifier(config)
 
@@ -65,6 +95,20 @@ class TradingBot:
         if self.execution.paper_engine:
             self.execution.paper_engine.scorer = self.wallet_scorer
             self.execution.paper_engine.notifier = self.notifier
+
+        # v14 Production Monitoring Systems
+        # Metrics logger: CSV/JSON structured logging
+        self.metrics = MetricsLogger(config)
+
+        # Parity checker: validate blockchain event decoding accuracy
+        self.parity = ParityChecker(config)
+
+        # Health monitor: comprehensive health checks with auto-recovery
+        self.health = HealthMonitor(config, bot_ref=self)
+
+        # Inject market service into paper engine for fee lookups
+        if self.execution.paper_engine:
+            self.execution.paper_engine.market_service = self.market
 
         # Heartbeat watchdog: detects if main loop hangs
         self._last_heartbeat = time.time()
@@ -80,6 +124,23 @@ class TradingBot:
         self._last_market_refresh = time.time()
         print(f"[*] Found {len(markets)} active markets")
         print(f"[*] Speed: {self._markets_per_cycle} markets/cycle, sequential, {CYCLE_SLEEP}s sleep")
+        
+        # Register markets with momentum strategy
+        if hasattr(self, 'momentum_strategy'):
+            registered_count = 0
+            for m in markets:
+                yes_token = m.get("yes_token_id")
+                no_token = m.get("no_token_id")
+                condition_id = m.get("condition_id", "")
+                title = m.get("title", "")
+                
+                if yes_token and no_token:
+                    was_registered = self.momentum_strategy.register_market(
+                        condition_id, yes_token, no_token, title
+                    )
+                    if was_registered:
+                        registered_count += 1
+            print(f"[*] Registered {registered_count}/{len(markets)} markets with momentum strategy (filtered by crypto Up/Down 5min/15min)")
 
         # Discover profitable traders from leaderboard ($3k-$10k/month)
         print("[*] Discovering profitable traders from leaderboard...")
@@ -89,8 +150,18 @@ class TradingBot:
         if self.blockchain_monitor:
             tracked_addresses = list(self.whale_tracker.tracked_wallets.keys())
             self.blockchain_monitor.update_tracked_wallets(tracked_addresses)
+            # v14: Update market cache to avoid per-event HTTP fetches
+            self.blockchain_monitor.update_market_cache(markets)
             self.blockchain_monitor.start()
             print(f"[BLOCKCHAIN] Real-time monitoring started for {len(tracked_addresses)} whales")
+
+        # Start CLOB WebSocket monitor if enabled (ultra-low latency alternative to blockchain)
+        if self.clob_websocket:
+            tracked_addresses = list(self.whale_tracker.tracked_wallets.keys())
+            self.clob_websocket.update_tracked_wallets(tracked_addresses)
+            self.clob_websocket.update_market_cache(markets)
+            self.clob_websocket.start()
+            print(f"[CLOB] WebSocket monitoring started for {len(tracked_addresses)} whales")
 
         # Startup notification
         self.notifier.notify_startup(
@@ -103,6 +174,9 @@ class TradingBot:
 
         while self.running:
             self._last_heartbeat = time.time()
+
+            # v14: Update health monitor heartbeat
+            self.health.update_main_loop_heartbeat()
 
             if self.risk.check_kill_switch():
                 self.shutdown()
@@ -121,6 +195,9 @@ class TradingBot:
                         self._market_offset = 0
                         self._last_market_refresh = now
                         print(f"[*] Market refresh: {len(markets)} active markets")
+                        # v14: Update blockchain monitor market cache
+                        if self.blockchain_monitor:
+                            self.blockchain_monitor.update_market_cache(markets)
                 except Exception as e:
                     print(f"[!] Market refresh failed: {e}")
 
@@ -132,33 +209,67 @@ class TradingBot:
             # ── Whale tracking: poll one wallet per cycle ─────
             self.whale_tracker.discover_whales()    # No-op if fetched recently
             self.whale_tracker.discover_network()   # No-op if scanned recently
-            signals = self.whale_tracker.poll_whale_activity()
+
+            # BUG FIX #1: Process real-time blockchain signals FIRST (2-3s latency)
+            blockchain_signals = self.whale_tracker.drain_blockchain_signals()
+            
+            # POLY-101: Process CLOB WebSocket signals (100-300ms latency - even faster than blockchain)
+            clob_signals = self.whale_tracker.drain_clob_signals()
+            
+            polled_signals = self.whale_tracker.poll_whale_activity()
+
+            # Combine all signals: CLOB (fastest) > blockchain > polled
+            signals = clob_signals + blockchain_signals + polled_signals
+
+            # v14: Record signal metrics
+            if clob_signals:
+                self.metrics.increment("clob_signals_received", len(clob_signals))
+                self.health.update_whale_signal()
+            if blockchain_signals:
+                self.metrics.increment("blockchain_signals_received", len(blockchain_signals))
+                self.health.update_whale_signal()
+            if polled_signals:
+                self.metrics.increment("api_signals_received", len(polled_signals))
 
             # Execute copy trades + exits in paper mode (crash-proofed)
             if signals and self.execution.paper_engine:
                 for signal in signals:
                     try:
+                        # v14: Record signal metrics
+                        self.metrics.increment_cumulative("total_signals_received")
+
                         if signal.get("type") == "COPY_EXIT":
                             # Whale is selling — close our matching position
-                            result = self.execution.paper_engine.close_copy_position(
-                                signal, risk_guard=self.risk
-                            )
+                            with self.metrics.timer("copy_exit_execution_ms"):
+                                result = self.execution.paper_engine.close_copy_position(
+                                    signal, risk_guard=self.risk
+                                )
                             if result and result.get("success"):
                                 self._copy_exits += 1
+                                self.metrics.increment("copy_exits_executed")
+                                self.metrics.increment_cumulative("total_trades_executed")
+                                self.health.update_trade_execution()
                         else:
                             # Whale is buying — open a copy position
-                            result = self.execution.paper_engine.execute_copy_trade(
-                                signal, current_exposure=self.risk.current_exposure
-                            )
+                            self.metrics.increment("copy_trades_attempted")
+                            with self.metrics.timer("copy_trade_execution_ms"):
+                                result = self.execution.paper_engine.execute_copy_trade(
+                                    signal, current_exposure=self.risk.current_exposure
+                                )
                             if result and result.get("success"):
                                 self._copy_trades += 1
                                 self.risk.add_exposure(result.get("total_cost", 0))
                                 self.notifier.notify_trade_opened(signal, result)
+                                self.metrics.increment("copy_trades_executed")
+                                self.metrics.increment_cumulative("total_trades_executed")
+                                self.health.update_trade_execution()
                             elif result:
                                 title = signal.get("market_title", "")[:40]
                                 print(f"[COPY] SKIP: {result.get('reason', '?')} — {title}")
+                                self.metrics.increment(f"skip_reason_{result.get('reason', 'unknown').replace(' ', '_')}")
                     except Exception as e:
                         print(f"[!] Copy trade error: {e}")
+                        self.metrics.increment("copy_trade_errors")
 
             # ── Arb scanning: rotate through markets ──────────
             # DISABLED by default: negative EV per 4 LLM reviews
@@ -168,7 +279,38 @@ class TradingBot:
 
                 for m in batch:
                     try:
-                        book = self.market.get_order_book(m)
+                        # FAST PATH: Try to get order book from CLOB WebSocket (instant)
+                        book = None
+                        if self.clob_websocket and hasattr(self.clob_websocket, 'order_book'):
+                            yes_token = m.get("yes_token_id") or m.get("yes_clob_token_id")
+                            no_token = m.get("no_token_id") or m.get("no_clob_token_id")
+                            
+                            if yes_token and no_token:
+                                # Get from WebSocket cache (no API call)
+                                yes_snapshot = self.clob_websocket.order_book.get_order_book_snapshot(yes_token, depth=10)
+                                no_snapshot = self.clob_websocket.order_book.get_order_book_snapshot(no_token, depth=10)
+                                
+                                if yes_snapshot.get("asks") and no_snapshot.get("asks"):  # Have recent data
+                                    book = {
+                                        "condition_id": m.get("condition_id"),
+                                        "yes_token_id": yes_token,
+                                        "no_token_id": no_token,
+                                        "bids_yes": yes_snapshot.get("bids", []),
+                                        "asks_yes": yes_snapshot.get("asks", []),
+                                        "bids_no": no_snapshot.get("bids", []),
+                                        "asks_no": no_snapshot.get("asks", []),
+                                        "_from_clob_ws": True  # Mark as fast
+                                    }
+                                    print(f"[CLOB] ✅ FAST: Got order book from WS for {m.get('condition_id', '')[:12]}... yes_asks={len(yes_snapshot.get('asks', []))}, no_asks={len(no_snapshot.get('asks', []))}")
+                                else:
+                                    print(f"[CLOB] ⚠️  EMPTY: No order book in cache for {m.get('condition_id', '')[:12]}... yes={yes_token[:8] if yes_token else 'None'}... no={no_token[:8] if no_token else 'None'}")
+                        
+                        # FALLBACK: Fetch from REST API if no WebSocket data
+                        if not book:
+                            book = self.market.get_order_book(m)
+                            if book:
+                                print(f"[CLOB] 🔄 SLOW: Got order book from REST API for {m.get('condition_id', '')[:12]}...")
+                        
                         if not book:
                             self._fetch_errors += 1
                             continue
@@ -210,6 +352,27 @@ class TradingBot:
                         data = self.execution.paper_engine.get_portfolio_data()
                         self.notifier.notify_daily_summary(data)
                     self._last_daily_summary = time.time()
+                    # v14: Generate daily parity report
+                    if self.parity:
+                        self.parity.generate_daily_report()
+                except Exception:
+                    pass
+
+            # v14: Periodic parity matching (every 5 minutes)
+            if self._cycle_count % 600 == 0:  # 600 cycles * 0.5s = 5 min
+                try:
+                    self.parity.run_matching()
+                except Exception as e:
+                    print(f"[PARITY] Matching error: {e}")
+
+            # v14: Update metrics gauges
+            if self._cycle_count % 60 == 0:  # Every 30 seconds (60 cycles * 0.5s)
+                try:
+                    self.metrics.set_gauge("tracked_wallets", len(self.whale_tracker.tracked_wallets))
+                    self.metrics.set_gauge("open_positions", len(self.execution.paper_engine.open_positions) if self.execution.paper_engine else 0)
+                    self.metrics.set_gauge("current_exposure", self.risk.current_exposure)
+                    if self.blockchain_monitor:
+                        self.metrics.set_gauge("blockchain_connected", 1 if self.blockchain_monitor.connected else 0)
                 except Exception:
                     pass
 
@@ -265,10 +428,28 @@ class TradingBot:
         print("[!] Shutting down...")
         self.running = False
         self.collector.flush()
+
+        # v14: Stop monitoring systems
+        if self.health:
+            self.health.stop()
+            print("[*] Health monitor stopped.")
+        if self.metrics:
+            self.metrics.stop()
+            print("[*] Metrics logger stopped.")
+        if self.parity:
+            self.parity._save_state()
+            print("[*] Parity state saved.")
+
         # Stop blockchain monitor
         if self.blockchain_monitor:
             self.blockchain_monitor.stop()
             print("[*] Blockchain monitor stopped.")
+
+        # Stop CLOB WebSocket monitor
+        if self.clob_websocket:
+            self.clob_websocket.stop()
+            print("[*] CLOB WebSocket monitor stopped.")
+
         # Flush all state files to prevent data loss
         try:
             if self.execution.paper_engine:

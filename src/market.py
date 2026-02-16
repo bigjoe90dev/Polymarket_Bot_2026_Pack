@@ -51,6 +51,7 @@ class MarketDataService:
                     "no_token_id": no_token["token_id"],
                     "yes_price": yes_token.get("price", 0),
                     "no_price": no_token.get("price", 0),
+                    "title": m.get("question", ""),  # For fee classification
                 })
 
         return all_markets
@@ -96,6 +97,7 @@ class MarketDataService:
                         "no_token_id": no_token["token_id"],
                         "yes_price": yes_token.get("price", 0),
                         "no_price": no_token.get("price", 0),
+                        "title": m.get("question", ""),  # For fee classification
                     })
 
             next_cursor = resp.get("next_cursor", "LTE=")
@@ -175,3 +177,126 @@ class MarketDataService:
             return {"healthy": True, "reason": "API error, proceeding"}
 
         return {"healthy": True, "reason": "Book exists"}
+
+    # ── Fee Rate Lookup (CRITICAL for profitability) ─────────
+    #
+    # v14 ENHANCEMENT: Fee tier accuracy is critical for:
+    # 1. Realistic paper trading PnL
+    # 2. Correct profitability analysis before LIVE
+    # 3. Position sizing decisions
+    #
+    # Polymarket fee structure (as of 2026):
+    # - Crypto fast markets (BTC/ETH up or down): 1000 bps (10%)
+    # - Sports/politics markets: 0 bps (0%)
+    # - Unknown/other: 200 bps (2% conservative fallback)
+    #
+    # Curved fee formula: fee = (bps/10000) * p * (1-p)
+    # where p is the share price
+
+    def get_fee_rate_bps(self, token_id, market_title="", condition_id=""):
+        """Get fee rate in basis points for a token.
+
+        Tries multiple approaches in order:
+        1. py-clob-client API (if available)
+        2. Market title classification
+        3. Conservative fallback (200 bps)
+
+        Args:
+            token_id: ERC1155 token ID
+            market_title: Market question/title (for classification)
+            condition_id: Condition ID (for caching)
+
+        Returns:
+            int: Fee rate in basis points (bps)
+        """
+        # Approach 1: Try to get from CLOB API
+        # NOTE: py-clob-client may not expose this directly
+        # Check the library docs for the correct method
+        try:
+            # Placeholder: this may not exist in current py-clob-client
+            # Check if get_market or get_simplified_market returns fee_bps
+            # If it does, uncomment and adjust this:
+            #
+            # market_info = self.client.get_market(condition_id)
+            # if market_info and "fee_bps" in market_info:
+            #     return int(market_info["fee_bps"])
+            pass
+        except Exception:
+            pass
+
+        # Approach 2: Classify by market title
+        if market_title:
+            fee_bps = self._classify_fee_tier(market_title)
+            if fee_bps is not None:
+                return fee_bps
+
+        # Approach 3: Conservative fallback
+        return 200  # 2% when unknown (pessimistic but safe)
+
+    def _classify_fee_tier(self, market_title):
+        """Classify fee tier based on market title patterns.
+
+        Returns:
+            int or None: Fee rate in bps, or None if cannot classify
+        """
+        if not market_title:
+            return None
+
+        title = market_title.upper()
+
+        # Crypto fast markets (high fee tier)
+        crypto_patterns = [
+            "UP OR DOWN",
+            "BITCOIN",
+            "BTC",
+            "ETHEREUM",
+            "ETH",
+            "SOLANA",
+            "SOL",
+            ":00AM",
+            ":30AM",
+            ":00PM",
+            ":30PM",
+        ]
+
+        for pattern in crypto_patterns:
+            if pattern in title:
+                return 1000  # 10% fee for crypto fast markets
+
+        # Sports markets (zero fee tier)
+        sports_patterns = [
+            " VS ",
+            " VS. ",
+            "MATCH WINNER",
+            "WIN ON 202",  # "win on 2026-02-10"
+            "O/U",
+            "OVER/UNDER",
+            "BO1",
+            "BO2",
+            "BO3",
+            "SET 1",
+            "SET 2",
+        ]
+
+        for pattern in sports_patterns:
+            if pattern in title:
+                return 0  # 0% fee for sports markets
+
+        # Politics/long-term markets (zero fee tier)
+        politics_patterns = [
+            "PRESIDENT",
+            "PRIME MINISTER",
+            "ELECTION",
+            "WIN THE 202",  # "win the 2026 World Cup"
+            "BY MARCH",
+            "BY APRIL",
+            "BY MAY",
+            "BY JUNE",
+        ]
+
+        for pattern in politics_patterns:
+            if pattern in title:
+                return 0  # 0% fee for politics markets
+
+        # Cannot classify
+        return None
