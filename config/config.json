@@ -1,7 +1,7 @@
 {
-  "_config_version": 16,
+  "_config_version": 17,
+  "BOT_MODE": "BTC_1H_ONLY",
   "USE_HOURLY_MARKETS": true,
-  "HOURLY_MARKET_IDS_FILE": "data/discovered_hourly_markets.json",
   "MIN_PROFIT": 0.003,
   "COST_BUFFER": 0.002,
   "MIN_LIQUIDITY": 0.5,

@@ -339,9 +339,10 @@ class TrendStrategy:
     Monitors real-time price changes and trades in the direction of momentum.
     """
     
-    def __init__(self, paper_engine=None, config: Dict = None):
+    def __init__(self, paper_engine=None, config: Dict = None, is_btc_1h_only: bool = False):
         self.paper_engine = paper_engine
         self.config = config or {}
+        self.is_btc_1h_only = is_btc_1h_only
         
         # Initialize trend tracker
         self.tracker = TrendTracker(self.config)
@@ -365,47 +366,29 @@ class TrendStrategy:
         self._lock = threading.Lock()
     
     def _is_1h_crypto_up_down(self, market_name: str) -> bool:
-        """Check if market is 1H timeframe "Up or Down" crypto market.
+        """Check if market is BTC Up/Down crypto market.
+        
+        NOTE: Duration filtering (1H) is already done by market.py via start/end times.
+        This method only checks for BTC + Up/Down format - trusting market.py's
+        duration-based filtering (50-70 min) instead of guessing from title words.
         
         Filters for:
-        - Crypto (BTC, ETH, SOL, XRP)
+        - Crypto (BTC)
         - Up or Down format
-        - 1H timeframe (1h, 1 hour, 60 min, 1hr, etc.)
         """
         if not market_name:
             return False
         
         name_lower = market_name.lower()
         
-        # Must be crypto
+        # Must be crypto (BTC) - trust config for allowed assets
         allowed_assets = self.config.get("TREND_ASSETS", ["BTC"])
-        is_crypto = False
-        for asset in allowed_assets:
-            if asset.lower() in name_lower or asset.lower().replace("btc", "bitcoin").replace("eth", "ethereum") in name_lower:
-                is_crypto = True
-                break
-        
+        is_crypto = any(asset.lower() in name_lower for asset in allowed_assets)
         if not is_crypto:
             return False
         
         # Must be Up or Down format
-        if "up or down" not in name_lower and "up/down" not in name_lower:
-            return False
-        
-        # Must have 1H timeframe indicators
-        timeframe_indicators = [
-            "1h", "1 hour", "1 hr", "60 min", "60minute",
-            "one hour", "1h ", " 1h", "hourly"
-        ]
-        has_timeframe = any(t in name_lower for t in timeframe_indicators)
-        
-        # Also accept markets that explicitly say "1 hour" or similar
-        if not has_timeframe:
-            # Check for patterns like "in 1 hour"
-            if re.search(r'in\s+1\s+hour', name_lower):
-                has_timeframe = True
-        
-        return has_timeframe
+        return "up or down" in name_lower or "up/down" in name_lower
     
     def register_market(
         self,
@@ -419,9 +402,12 @@ class TrendStrategy:
         """Register a market with its token IDs.
         Returns True if market was registered, False if filtered out."""
         
-        # Filter: Only register 1H Up/Down crypto markets
-        if not self._is_1h_crypto_up_down(market_name):
-            return False
+        # BTC_1H_ONLY mode: Trust market.py's filtering - accept all markets passed in
+        # market.py already filters by BTC + Up/Down + duration 50-70 min
+        if not self.is_btc_1h_only:
+            # FULL mode: Apply additional filter
+            if not self._is_1h_crypto_up_down(market_name):
+                return False
         
         # Store metadata for time-left parsing (includes end_date!)
         self.market_metadata[condition_id] = {

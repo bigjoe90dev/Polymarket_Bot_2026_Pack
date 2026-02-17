@@ -26,6 +26,11 @@ MARKET_REFRESH_SECONDS = 120     # Re-fetch full market list every 2 min
 class TradingBot:
     def __init__(self, config):
         self.config = config
+        self.bot_mode = config.get("BOT_MODE", "FULL")
+        
+        # BTC_1H_ONLY mode: Clean mode for 1H BTC trend following only
+        self.is_btc_1h_only = (self.bot_mode == "BTC_1H_ONLY")
+        
         self.market = MarketDataService(config)
         self.risk = RiskGuard(config)
         self.execution = ExecutionEngine(config, self.risk, self.market)
@@ -47,74 +52,71 @@ class TradingBot:
         # Data collection for backtesting
         self.collector = DataCollector(enabled=config.get("COLLECT_DATA", True))
 
-        # Wallet scoring: deep performance tracking + flow analysis
-        self.wallet_scorer = WalletScorer(config)
-
-        # Whale tracking for copy trading (with scorer for market filtering)
-        self.whale_tracker = WhaleTracker(config, wallet_scorer=self.wallet_scorer)
-
-        # Blockchain monitor for real-time whale trades (2-3s latency vs 5-12min polling)
+        # Initialize whale systems ONLY in FULL mode
+        self.wallet_scorer = None
+        self.whale_tracker = None
         self.blockchain_monitor = None
-        if config.get("USE_BLOCKCHAIN_MONITOR", False):
-            def on_whale_trade(whale_address, signal_data):
-                """Callback when blockchain monitor detects whale trade."""
-                self.whale_tracker.add_blockchain_signal(whale_address, signal_data)
-
-            self.blockchain_monitor = BlockchainMonitor(config, on_whale_trade)
-            print("[*] Blockchain monitor initialized (will start after whale discovery)")
-
-        # CLOB WebSocket monitor for ultra-low latency whale trades (~300ms vs 2-3s blockchain)
         self.clob_websocket = None
-        self._ws_healthy = False  # Track WebSocket health for fallback
-        self._ws_last_healthy_time = 0  # Track when WS last became healthy
         
-        # Always create momentum strategy (works with both WebSocket and REST polling)
+        if not self.is_btc_1h_only:
+            # FULL mode: Initialize all whale/copy trading systems
+            self.wallet_scorer = WalletScorer(config)
+            self.whale_tracker = WhaleTracker(config, wallet_scorer=self.wallet_scorer)
+
+            # Blockchain monitor for real-time whale trades
+            if config.get("USE_BLOCKCHAIN_MONITOR", False):
+                def on_whale_trade(whale_address, signal_data):
+                    self.whale_tracker.add_blockchain_signal(whale_address, signal_data)
+
+                self.blockchain_monitor = BlockchainMonitor(config, on_whale_trade)
+                print("[*] Blockchain monitor initialized (will start after whale discovery)")
+
+            # CLOB WebSocket monitor for whale trades
+            if config.get("USE_CLOB_WEBSOCKET", False):
+                def on_clob_trade(signal_data):
+                    self.whale_tracker.add_clob_signal(signal_data)
+
+                self.clob_websocket = CLOBWebSocketMonitor(config, on_clob_trade)
+                print("[*] CLOB WebSocket monitor initialized")
+        
+        # WS health tracking (for momentum strategy fallback)
+        self._ws_healthy = False
+        self._ws_last_healthy_time = 0
+        
+        # Always create momentum strategy for BTC_1H_ONLY mode
         self.momentum_strategy = MomentumStrategy(
             paper_engine=self.execution.paper_engine,
             config=config,
+            is_btc_1h_only=self.is_btc_1h_only,
         )
-        print("[*] Momentum strategy initialized (1H trend-following, WS + REST fallback)")
-        
-        if config.get("USE_CLOB_WEBSOCKET", False):
-            def on_clob_trade(signal_data):
-                """Callback when CLOB WebSocket detects whale trade."""
-                self.whale_tracker.add_clob_signal(signal_data)
-
-            self.clob_websocket = CLOBWebSocketMonitor(config, on_clob_trade)
-            print("[*] CLOB WebSocket monitor initialized (will start after whale discovery)")
-            
-            # Register momentum callback with CLOB websocket (CONDITIONAL - may be None)
-            def momentum_callback(token_id, price):
-                if self.clob_websocket:
-                    self.momentum_strategy.on_price_update(token_id, price, source="ws")
-            
-            # Only assign if clob_websocket was successfully created
-            if self.clob_websocket:
-                self.clob_websocket.price_callback = momentum_callback
+        if self.is_btc_1h_only:
+            print("[*] Momentum strategy initialized (BTC_1H_ONLY mode - NO whale/copy systems)")
+        else:
+            print("[*] Momentum strategy initialized (1H trend-following, WS + REST fallback)")
 
         # Telegram notifications
         self.notifier = TelegramNotifier(config)
 
-        # Inject scorer + notifier into paper engine if it exists
-        if self.execution.paper_engine:
+        # Inject scorer + notifier into paper engine (only in FULL mode)
+        if self.execution.paper_engine and not self.is_btc_1h_only:
             self.execution.paper_engine.scorer = self.wallet_scorer
             self.execution.paper_engine.notifier = self.notifier
 
-        # v14 Production Monitoring Systems
-        # Metrics logger: CSV/JSON structured logging
+        # Production monitoring systems (simplified for BTC_1H_ONLY)
         self.metrics = MetricsLogger(config)
-
-        # Parity checker: validate blockchain event decoding accuracy
-        self.parity = ParityChecker(config)
-
-        # Health monitor: comprehensive health checks with auto-recovery
+        
+        if not self.is_btc_1h_only:
+            self.parity = ParityChecker(config)
+        else:
+            self.parity = None
+            
         self.health = HealthMonitor(config, bot_ref=self)
 
         # Inject market service into paper engine for fee lookups
         if self.execution.paper_engine:
             self.execution.paper_engine.market_service = self.market
 
-        # Heartbeat watchdog: detects if main loop hangs
+        # Heartbeat watchdog
         self._last_heartbeat = time.time()
         self._heartbeat_thread = threading.Thread(
             target=self._watchdog, daemon=True
@@ -146,37 +148,49 @@ class TradingBot:
                     )
                     if was_registered:
                         registered_count += 1
-            print(f"[*] Registered {registered_count}/{len(markets)} markets with momentum strategy (filtered by 1H Up/Down crypto)")
+            if self.is_btc_1h_only:
+                print(f"[*] Registered {registered_count}/{len(markets)} markets with momentum strategy (BTC_1H_ONLY mode)")
+            else:
+                print(f"[*] Registered {registered_count}/{len(markets)} markets with momentum strategy (filtered by 1H Up/Down crypto)")
 
-        # Discover profitable traders from leaderboard ($3k-$10k/month)
-        print("[*] Discovering profitable traders from leaderboard...")
-        self.whale_tracker.discover_whales()
+        # BTC_1H_ONLY mode: Skip all whale/copy trading systems
+        if self.is_btc_1h_only:
+            print("[*] BTC_1H_ONLY: Skipping whale tracker, blockchain monitor, CLOB websocket")
+        else:
+            # FULL mode: Initialize whale systems
+            print("[*] Discovering profitable traders from leaderboard...")
+            self.whale_tracker.discover_whales()
 
-        # Start blockchain monitor if enabled (after whale discovery so we have wallets to track)
-        if self.blockchain_monitor:
-            tracked_addresses = list(self.whale_tracker.tracked_wallets.keys())
-            self.blockchain_monitor.update_tracked_wallets(tracked_addresses)
-            # v14: Update market cache to avoid per-event HTTP fetches
-            self.blockchain_monitor.update_market_cache(markets)
-            self.blockchain_monitor.start()
-            print(f"[BLOCKCHAIN] Real-time monitoring started for {len(tracked_addresses)} whales")
+            # Start blockchain monitor if enabled
+            if self.blockchain_monitor:
+                tracked_addresses = list(self.whale_tracker.tracked_wallets.keys())
+                self.blockchain_monitor.update_tracked_wallets(tracked_addresses)
+                self.blockchain_monitor.update_market_cache(markets)
+                self.blockchain_monitor.start()
+                print(f"[BLOCKCHAIN] Real-time monitoring started for {len(tracked_addresses)} whales")
 
-        # Start CLOB WebSocket monitor if enabled (ultra-low latency alternative to blockchain)
-        if self.clob_websocket:
-            tracked_addresses = list(self.whale_tracker.tracked_wallets.keys())
-            self.clob_websocket.update_tracked_wallets(tracked_addresses)
-            self.clob_websocket.update_market_cache(markets)
-            self.clob_websocket.start()
-            print(f"[CLOB] WebSocket monitoring started for {len(tracked_addresses)} whales")
+            # Start CLOB WebSocket monitor if enabled
+            if self.clob_websocket:
+                tracked_addresses = list(self.whale_tracker.tracked_wallets.keys())
+                self.clob_websocket.update_tracked_wallets(tracked_addresses)
+                self.clob_websocket.update_market_cache(markets)
+                self.clob_websocket.start()
+                print(f"[CLOB] WebSocket monitoring started for {len(tracked_addresses)} whales")
 
-        # Startup notification
-        self.notifier.notify_startup(
-            len(self.whale_tracker.tracked_wallets), len(markets)
-        )
+            # Startup notification
+            self.notifier.notify_startup(
+                len(self.whale_tracker.tracked_wallets), len(markets)
+            )
 
         if not markets:
-            print("[!] No active markets found. Exiting.")
-            return
+            print("[!] No active markets found - HARD FAIL")
+            raise SystemExit(1)
+
+        # Track previous window state for transition detection
+        self._was_in_window = False
+        
+        # Heartbeat tracker
+        self._last_heartbeat_log = 0
 
         while self.running:
             self._last_heartbeat = time.time()
@@ -207,25 +221,59 @@ class TradingBot:
                 except Exception as e:
                     print(f"[!] Market refresh failed: {e}")
 
+            # ── BTC_1H_ONLY: Check market window and log transitions ──
+            if self.is_btc_1h_only and markets:
+                # Get the first market (next to trade)
+                first_market = markets[0]
+                in_window = first_market.get('in_window', False)
+                minutes_left = first_market.get('minutes_left', 0)
+                minutes_to_start = first_market.get('minutes_to_start', 0)
+                
+                # Check for UPCOMING -> IN_WINDOW transition
+                if in_window and not self._was_in_window:
+                    print(f"[*] 🚀 ENTERING WINDOW: {first_market.get('title', '')[:60]}")
+                    print(f"[*] Status: IN_WINDOW - {minutes_left} min left")
+                    print(f"[*] Entry allowed: YES" if minutes_left and minutes_left >= 5 else f"[*] Entry allowed: NO (cutoff)")
+                
+                # Update window state
+                self._was_in_window = in_window
+                
+                # Heartbeat log every 60 seconds when not in window
+                if not in_window and (now - self._last_heartbeat_log >= 60):
+                    print(f"[*] 💤 Waiting: starts in {minutes_to_start} min - {first_market.get('title', '')[:50]}...")
+                    self._last_heartbeat_log = now
+            elif not markets and (now - self._last_heartbeat_log >= 60):
+                # No markets at all - heartbeat log
+                print(f"[*] 💤 Waiting: no active markets, retrying...")
+                self._last_heartbeat_log = now
+
             # ── Dynamic risk limits: scale with account balance ──
             if self.execution.paper_engine:
                 pe = self.execution.paper_engine
                 self.risk.update_limits(pe.portfolio["cash_balance"], pe.starting_balance)
 
-            # ── Whale tracking: poll one wallet per cycle ─────
-            self.whale_tracker.discover_whales()    # No-op if fetched recently
-            self.whale_tracker.discover_network()   # No-op if scanned recently
+            # ── BTC_1H_ONLY mode: Skip all whale tracking ─────
+            if not self.is_btc_1h_only:
+                # FULL mode: Process whale tracking
+                self.whale_tracker.discover_whales()    # No-op if fetched recently
+                self.whale_tracker.discover_network()   # No-op if scanned recently
 
-            # BUG FIX #1: Process real-time blockchain signals FIRST (2-3s latency)
-            blockchain_signals = self.whale_tracker.drain_blockchain_signals()
-            
-            # POLY-101: Process CLOB WebSocket signals (100-300ms latency - even faster than blockchain)
-            clob_signals = self.whale_tracker.drain_clob_signals()
-            
-            polled_signals = self.whale_tracker.poll_whale_activity()
+                # Process real-time blockchain signals
+                blockchain_signals = self.whale_tracker.drain_blockchain_signals()
+                
+                # Process CLOB WebSocket signals
+                clob_signals = self.whale_tracker.drain_clob_signals()
+                
+                polled_signals = self.whale_tracker.poll_whale_activity()
 
-            # Combine all signals: CLOB (fastest) > blockchain > polled
-            signals = clob_signals + blockchain_signals + polled_signals
+                # Combine all signals
+                signals = clob_signals + blockchain_signals + polled_signals
+            else:
+                # BTC_1H_ONLY mode: No whale signals
+                signals = []
+                blockchain_signals = []
+                clob_signals = []
+                polled_signals = []
 
             # ── Momentum Strategy: WS-first + REST fallback ─────
             # Check WebSocket health and switch to REST polling if needed
@@ -266,7 +314,8 @@ class TradingBot:
                 self.metrics.increment("api_signals_received", len(polled_signals))
 
             # Execute copy trades + exits in paper mode (crash-proofed)
-            if signals and self.execution.paper_engine:
+            # BTC_1H_ONLY mode: Skip all copy trading
+            if not self.is_btc_1h_only and signals and self.execution.paper_engine:
                 for signal in signals:
                     try:
                         # v14: Record signal metrics
@@ -491,16 +540,23 @@ class TradingBot:
                 print("[*] Paper state saved.")
         except Exception as e:
             print(f"[!] Paper state flush failed: {e}")
-        try:
-            self.wallet_scorer._save_state()
-            print("[*] Wallet scorer saved.")
-        except Exception as e:
-            print(f"[!] Wallet scorer flush failed: {e}")
-        try:
-            self.whale_tracker._save_state()
-            print("[*] Whale state saved.")
-        except Exception as e:
-            print(f"[!] Whale state flush failed: {e}")
+        
+        # Only save wallet_scorer and whale_tracker in FULL mode (not BTC_1H_ONLY)
+        if not self.is_btc_1h_only:
+            try:
+                if self.wallet_scorer:
+                    self.wallet_scorer._save_state()
+                    print("[*] Wallet scorer saved.")
+            except Exception as e:
+                print(f"[!] Wallet scorer flush failed: {e}")
+            try:
+                if self.whale_tracker:
+                    self.whale_tracker._save_state()
+                    print("[*] Whale state saved.")
+            except Exception as e:
+                print(f"[!] Whale state flush failed: {e}")
+        else:
+            print("[*] Skipping whale/wallet state save (BTC_1H_ONLY mode)")
 
     def _watchdog(self):
         """Background watchdog: detects hung main loop, emergency-saves state."""

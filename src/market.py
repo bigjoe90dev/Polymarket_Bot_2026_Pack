@@ -3,8 +3,24 @@ import os
 from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import BookParams
+import requests
 
 CLOB_HOST = "https://clob.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
+
+# Month names for slug generation
+MONTHS = ['january', 'february', 'march', 'april', 'may', 'june',
+          'july', 'august', 'september', 'october', 'november', 'december']
+
+
+def fmt(value, ndp=2):
+    """Safe formatting - returns 'N/A' if value is None."""
+    if value is None:
+        return "N/A"
+    try:
+        return f"{value:.{ndp}f}"
+    except (TypeError, ValueError):
+        return "N/A"
 
 
 class MarketDataService:
@@ -13,32 +29,237 @@ class MarketDataService:
         # L0 client: no auth needed for reading markets and order books
         self.client = ClobClient(CLOB_HOST)
         
-        # Load hourly market IDs if enabled
-        self._hourly_market_ids = set()
-        if config.get("USE_HOURLY_MARKETS", False):
-            self._load_hourly_market_ids()
+        # For 1H discovery
+        self._hourly_markets = []
+        self._hourly_discovered = False
     
-    def _load_hourly_market_ids(self):
-        """Load hourly market condition IDs from discovered markets file."""
-        ids_file = self.config.get("HOURLY_MARKET_IDS_FILE", "data/discovered_hourly_markets.json")
-        if os.path.exists(ids_file):
+    def _discover_hourly_markets(self):
+        """Dynamically discover 1H BTC Up/Down markets from Gamma API using slug generation."""
+        if self._hourly_discovered:
+            return
+        
+        print("[*] Discovering 1H BTC Up/Down markets from Gamma API...")
+        
+        # Generate candidate slugs for next 7 days
+        slugs = []
+        today = datetime.now(timezone.utc)
+        
+        for day_offset in range(0, 7):
+            day = today + timedelta(days=day_offset)
+            month_name = MONTHS[day.month - 1]
+            
+            # Generate hours 8AM-11PM ET (1PM-4AM UTC next day)
+            for hour in range(8, 24):
+                slug = f'bitcoin-up-or-down-{month_name}-{day.day}-{hour}pm-et'
+                slugs.append(slug)
+        
+        print(f"[*] Testing {len(slugs)} candidate slugs...")
+        
+        # Fetch markets by slug (parallel)
+        valid_markets = []
+        
+        def fetch_slug(slug):
             try:
-                with open(ids_file) as f:
-                    data = json.load(f)
+                resp = requests.get(f'{GAMMA_API}/markets?slug={slug}', timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data and isinstance(data, list) and len(data) > 0:
+                        return data[0]
+            except:
+                pass
+            return None
+        
+        # Use ThreadPoolExecutor for speed
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(fetch_slug, slug): slug for slug in slugs}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if not result:
+                    continue
                 
-                # Load condition IDs from one_hour markets
-                for market in data.get("one_hour", []):
-                    cid = market.get("condition_id")
-                    if cid:
-                        self._hourly_market_ids.add(cid.lower())
+                # Check if market is active
+                if not result.get("active", False):
+                    continue
+                # accepting_orders can be None or True - treat None as True (open for trading)
+                accepting = result.get("accepting_orders")
+                if accepting is False:  # Only skip if explicitly False
+                    continue
+                if result.get("closed", False) or result.get("archived", False):
+                    continue
                 
-                print(f"[+] Loaded {len(self._hourly_market_ids)} hourly market condition IDs")
-            except Exception as e:
-                print(f"[!] Error loading hourly markets: {e}")
+                # Check question
+                question = result.get("question", "").lower()
+                if "bitcoin" not in question and "btc" not in question:
+                    continue
+                if "up or down" not in question and "up/down" not in question:
+                    continue
+                
+                # Get times - eventStartTime is the actual 1H window start
+                # startDate is when the market was created, not the window start
+                start_time = result.get('eventStartTime', result.get('startTime', ''))
+                end_date = result.get('endDate', '')
+                
+                if not start_time or not end_date:
+                    continue
+                
+                # Parse duration
+                try:
+                    start_time = start_time.replace('Z', '+00:00')
+                    if '.' in start_time:
+                        start_time = start_time.split('.')[0] + '+00:00'
+                    
+                    end_date = end_date.replace('Z', '+00:00')
+                    if '.' in end_date:
+                        end_date = end_date.split('.')[0] + '+00:00'
+                    
+                    start_dt = datetime.fromisoformat(start_time)
+                    end_dt = datetime.fromisoformat(end_date)
+                    
+                    duration_min = (end_dt - start_dt).total_seconds() / 60
+                    
+                    # Must be ~60 minutes (1 hour)
+                    if not (50 <= duration_min <= 70):
+                        continue
+                    
+                    # Check if resolves within reasonable time (not past, not too far)
+                    now = datetime.now(timezone.utc)
+                    hours_until = (end_dt - now).total_seconds() / 3600
+                    
+                    # Accept markets that resolve in next 12 hours (for trading)
+                    if hours_until < -1:  # Already resolved
+                        continue
+                    
+                    # Get token info from Gamma response
+                    # Gamma returns clobTokenIds as JSON string
+                    token_ids = json.loads(result.get('clobTokenIds', '[]'))
+                    
+                    if len(token_ids) != 2:
+                        continue
+                    
+                    yes_token_id = token_ids[0]
+                    no_token_id = token_ids[1]
+                    
+                    # Get current prices from order book or use default
+                    # For now, use outcomePrices if available
+                    outcome_prices = json.loads(result.get('outcomePrices', '["0.5", "0.5"]'))
+                    yes_price = float(outcome_prices[0]) if len(outcome_prices) > 0 else 0.5
+                    no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else 0.5
+                    
+                    # Compute market status fields
+                    accepting = result.get("accepting_orders")
+                    accepting_orders = accepting is not False  # True if None or True
+                    
+                    # Compute in_window and time remaining
+                    now = datetime.now(timezone.utc)
+                    minutes_left = None
+                    minutes_to_start = None
+                    in_window = False
+                    
+                    if start_dt and end_dt:
+                        if start_dt <= now <= end_dt:
+                            # Currently in the 1-hour window
+                            in_window = True
+                            minutes_left = int((end_dt - now).total_seconds() / 60)
+                        elif now < start_dt:
+                            # Market hasn't started yet
+                            minutes_to_start = int((start_dt - now).total_seconds() / 60)
+                    
+                    valid_markets.append({
+                        "condition_id": result.get("condition_id"),
+                        "yes_token_id": yes_token_id,
+                        "no_token_id": no_token_id,
+                        "yes_price": yes_price,
+                        "no_price": no_price,
+                        "title": result.get("question", ""),
+                        "end_date": end_date,
+                        "start_time": start_time,
+                        "duration_min": duration_min,
+                        "hours_until": hours_until,
+                        "accepting_orders": accepting_orders,
+                        "in_window": in_window,
+                        "minutes_left": minutes_left,
+                        "minutes_to_start": minutes_to_start,
+                    })
+                    
+                except Exception as e:
+                    continue
+        
+        # Sort by hours until resolution
+        valid_markets.sort(key=lambda x: x.get('hours_until', 999))
+        
+        self._hourly_markets = valid_markets
+        self._hourly_discovered = True
+        
+        # Print summary
+        print(f"\n{'='*60}")
+        print(f"FOUND {len(self._hourly_markets)} VALID 1H BTC UP/DOWN MARKETS")
+        print(f"{'='*60}")
+        
+        if len(self._hourly_markets) == 0:
+            print("[!] ERROR: No 1H BTC Up/Down markets found!")
+            print("[!] HARD FAIL: Cannot trade anything else. Exiting.")
+            raise SystemExit(1)
+        
+        # Print 5 examples
+        print("\nExample markets:")
+        for i, market in enumerate(self._hourly_markets[:5]):
+            print(f"  {i+1}. {market['title'][:50]}")
+            print(f"     Start: {market['start_time'][:19]}")
+            print(f"     End: {market['end_date'][:19]}")
+            print(f"     Duration: {market['duration_min']:.0f} min")
+            hrs = market.get('hours_until', 0)
+            if hrs >= 0:
+                print(f"     Resolves in: {hrs:.1f} hours")
+            print()
+        
+        print(f"{'='*60}\n")
+        
+        # Get active (not resolved) markets only
+        active_markets = [m for m in self._hourly_markets if m.get('hours_until', -1) >= 0]
+        
+        # Print market status (first active market sorted by hours_until)
+        if active_markets:
+            first_market = active_markets[0]
+            in_window = first_market.get('in_window', False)
+            minutes_left = first_market.get('minutes_left')
+            minutes_to_start = first_market.get('minutes_to_start')
+            
+            if in_window:
+                print(f"[*] WATCHING: {first_market['title'][:60]}")
+                print(f"[*] Status: IN_WINDOW - {minutes_left} min left")
+                print(f"[*] Entry allowed: YES" if minutes_left and minutes_left >= 5 else f"[*] Entry allowed: NO (cutoff)")
+            else:
+                print(f"[*] NEXT MARKET: {first_market['title'][:60]}")
+                print(f"[*] Status: UPCOMING - starts in {minutes_to_start} min")
+                print(f"[*] Entry allowed: NO (waiting for window)")
+        elif self._hourly_markets:
+            # All markets resolved
+            print(f"[*] No active markets - waiting for next hourly market")
+        print()
 
     def get_active_markets(self):
         """Spec 6.2: Pulls active markets (YES/NO only).
-        Uses get_sampling_simplified_markets for pre-filtered active markets."""
+        Uses dynamic 1H discovery if enabled in config.
+        
+        Returns only markets that are not yet resolved (hours_until >= 0)."""
+        
+        use_hourly = self.config.get("USE_HOURLY_MARKETS", False)
+        
+        if use_hourly:
+            # Dynamically discover 1H markets
+            self._discover_hourly_markets()
+            
+            if self._hourly_markets:
+                # Filter out resolved markets - only return active ones
+                active_markets = [m for m in self._hourly_markets if m.get('hours_until', -1) >= 0]
+                return active_markets
+            else:
+                # If no hourly markets found, hard fail
+                print("[!] No hourly markets available - HARD FAIL")
+                raise SystemExit(1)
+        
+        # Default: get all active markets from CLOB
         all_markets = []
 
         try:
@@ -46,7 +267,6 @@ class MarketDataService:
             data = resp if isinstance(resp, list) else resp.get("data", [])
         except Exception as e:
             print(f"[!] Error fetching sampling markets: {e}")
-            # Fallback to paginated scan
             return self._get_active_markets_fallback()
 
         for m in data:
@@ -71,37 +291,14 @@ class MarketDataService:
                     no_token = t
 
             if yes_token and no_token:
-                # Filter for hourly markets if enabled
-                cond_id = m.get("condition_id", "").lower()
-                if self._hourly_market_ids and cond_id not in self._hourly_market_ids:
-                    continue
-                
-                # Filter: skip markets that resolve in more than X hours
-                end_date = m.get("endDate") or m.get("end_date")
-                if end_date:
-                    try:
-                        # Parse end date
-                        end_str = end_date.replace('Z', '+00:00')
-                        if '.' in end_str:
-                            end_str = end_str.split('.')[0] + '+00:00'
-                        end_dt = datetime.fromisoformat(end_str)
-                        now = datetime.now(timezone.utc)
-                        
-                        # Skip if more than 4 hours away (reduce to relevant set)
-                        hours_until = (end_dt - now).total_seconds() / 3600
-                        if hours_until > 4:
-                            continue
-                    except:
-                        pass
-                
                 all_markets.append({
                     "condition_id": m["condition_id"],
                     "yes_token_id": yes_token["token_id"],
                     "no_token_id": no_token["token_id"],
                     "yes_price": yes_token.get("price", 0),
                     "no_price": no_token.get("price", 0),
-                    "title": m.get("question", ""),  # For fee classification
-                    "end_date": end_date,
+                    "title": m.get("question", ""),
+                    "end_date": m.get("endDate") or m.get("end_date"),
                 })
 
         return all_markets
@@ -142,211 +339,17 @@ class MarketDataService:
 
                 if yes_token and no_token:
                     all_markets.append({
-                        "condition_id": m["condition_id"],
-                        "yes_token_id": yes_token["token_id"],
-                        "no_token_id": no_token["token_id"],
+                        "condition_id": m.get("condition_id"),
+                        "yes_token_id": yes_token.get("token_id"),
+                        "no_token_id": no_token.get("token_id"),
                         "yes_price": yes_token.get("price", 0),
                         "no_price": no_token.get("price", 0),
-                        "title": m.get("question", ""),  # For fee classification
+                        "title": m.get("question", ""),
+                        "end_date": m.get("endDate"),
                     })
 
-            next_cursor = resp.get("next_cursor", "LTE=")
-            if next_cursor == "LTE=":
+            next_cursor = resp.get("next_cursor")
+            if not next_cursor:
                 break
 
         return all_markets
-
-    def get_order_book(self, market, client=None):
-        """Fetch live order book depth for both YES and NO sides.
-
-        Pass client= for thread-safe parallel use (each thread
-        should create its own ClobClient to avoid shared session issues).
-        """
-        if not market:
-            return None
-
-        yes_id = market.get("yes_token_id")
-        no_id = market.get("no_token_id")
-
-        if not yes_id or not no_id:
-            return None
-
-        c = client or self.client
-
-        try:
-            yes_book = c.get_order_book(yes_id)
-            no_book = c.get_order_book(no_id)
-        except Exception:
-            return None
-
-        # Transform to format expected by strategy.py: [[price, size], ...]
-        asks_yes = [[ask.price, ask.size] for ask in yes_book.asks] if yes_book.asks else []
-        asks_no = [[ask.price, ask.size] for ask in no_book.asks] if no_book.asks else []
-        bids_yes = [[bid.price, bid.size] for bid in yes_book.bids] if yes_book.bids else []
-        bids_no = [[bid.price, bid.size] for bid in no_book.bids] if no_book.bids else []
-
-        if not asks_yes or not asks_no:
-            return None
-
-        return {
-            "condition_id": market["condition_id"],
-            "yes_token_id": yes_id,
-            "no_token_id": no_id,
-            "asks_yes": asks_yes,
-            "asks_no": asks_no,
-            "bids_yes": bids_yes,
-            "bids_no": bids_no,
-        }
-
-    # ── Book Health Check (Defensive Execution) ──────────────
-    #
-    # Polymarket 15-min binary markets move fast: the winning side hits
-    # $0.99 within minutes. The whale enters at $0.50-$0.55 and by the
-    # time we poll, the book shows $0.99 asks even on LIVE markets.
-    #
-    # Old approach (spread check) blocked EVERYTHING — zero trades in 11h.
-    #
-    # New approach for paper mode: only block RESOLVED markets (API 404).
-    # For live markets, the 12-layer stress simulator handles slippage,
-    # rejection, and fill probability realistically.
-
-    def check_book_health(self, token_id):
-        """Check if a market's order book still exists (not resolved).
-
-        A 404 means the market resolved and no book exists — block trade.
-        Any valid book response means the market is live — allow trade.
-        Non-404 errors (network/rate limit): fail-open for paper mode.
-        """
-        try:
-            self.client.get_order_book(token_id)
-        except Exception as e:
-            err_str = str(e)
-            if "404" in err_str or "No orderbook" in err_str:
-                return {"healthy": False,
-                        "reason": "Market resolved (no orderbook)"}
-            return {"healthy": True, "reason": "API error, proceeding"}
-
-        return {"healthy": True, "reason": "Book exists"}
-
-    # ── Fee Rate Lookup (CRITICAL for profitability) ─────────
-    #
-    # v14 ENHANCEMENT: Fee tier accuracy is critical for:
-    # 1. Realistic paper trading PnL
-    # 2. Correct profitability analysis before LIVE
-    # 3. Position sizing decisions
-    #
-    # Polymarket fee structure (as of 2026):
-    # - Crypto fast markets (BTC/ETH up or down): 1000 bps (10%)
-    # - Sports/politics markets: 0 bps (0%)
-    # - Unknown/other: 200 bps (2% conservative fallback)
-    #
-    # Curved fee formula: fee = (bps/10000) * p * (1-p)
-    # where p is the share price
-
-    def get_fee_rate_bps(self, token_id, market_title="", condition_id=""):
-        """Get fee rate in basis points for a token.
-
-        Tries multiple approaches in order:
-        1. py-clob-client API (if available)
-        2. Market title classification
-        3. Conservative fallback (200 bps)
-
-        Args:
-            token_id: ERC1155 token ID
-            market_title: Market question/title (for classification)
-            condition_id: Condition ID (for caching)
-
-        Returns:
-            int: Fee rate in basis points (bps)
-        """
-        # Approach 1: Try to get from CLOB API
-        # NOTE: py-clob-client may not expose this directly
-        # Check the library docs for the correct method
-        try:
-            # Placeholder: this may not exist in current py-clob-client
-            # Check if get_market or get_simplified_market returns fee_bps
-            # If it does, uncomment and adjust this:
-            #
-            # market_info = self.client.get_market(condition_id)
-            # if market_info and "fee_bps" in market_info:
-            #     return int(market_info["fee_bps"])
-            pass
-        except Exception:
-            pass
-
-        # Approach 2: Classify by market title
-        if market_title:
-            fee_bps = self._classify_fee_tier(market_title)
-            if fee_bps is not None:
-                return fee_bps
-
-        # Approach 3: Conservative fallback
-        return 200  # 2% when unknown (pessimistic but safe)
-
-    def _classify_fee_tier(self, market_title):
-        """Classify fee tier based on market title patterns.
-
-        Returns:
-            int or None: Fee rate in bps, or None if cannot classify
-        """
-        if not market_title:
-            return None
-
-        title = market_title.upper()
-
-        # Crypto fast markets (high fee tier)
-        crypto_patterns = [
-            "UP OR DOWN",
-            "BITCOIN",
-            "BTC",
-            "ETHEREUM",
-            "ETH",
-            "SOLANA",
-            "SOL",
-            ":00AM",
-            ":30AM",
-            ":00PM",
-            ":30PM",
-        ]
-
-        for pattern in crypto_patterns:
-            if pattern in title:
-                return 1000  # 10% fee for crypto fast markets
-
-        # Sports markets (zero fee tier)
-        sports_patterns = [
-            " VS ",
-            " VS. ",
-            "MATCH WINNER",
-            "WIN ON 202",  # "win on 2026-02-10"
-            "O/U",
-            "OVER/UNDER",
-            "BO1",
-            "BO2",
-            "BO3",
-            "SET 1",
-            "SET 2",
-        ]
-
-        for pattern in sports_patterns:
-            if pattern in title:
-                return 0  # 0% fee for sports markets
-
-        # Politics/long-term markets (zero fee tier)
-        politics_patterns = [
-            "PRESIDENT",
-            "PRIME MINISTER",
-            "ELECTION",
-            "WIN THE 202",  # "win the 2026 World Cup"
-            "BY MARCH",
-            "BY APRIL",
-            "BY MAY",
-            "BY JUNE",
-        ]
-
-        for pattern in politics_patterns:
-            if pattern in title:
-                return 0  # 0% fee for politics markets
-
-        # Cannot classify
-        return None

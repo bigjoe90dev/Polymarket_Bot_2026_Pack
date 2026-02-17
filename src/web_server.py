@@ -82,8 +82,25 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
         hot_count = sum(1 for v in bot._market_heat.values() if v < 0.01)
         rotation_pct = round(bot._market_offset / max(total_markets, 1) * 100)
 
+        # Get current market info for BTC_1H_ONLY mode
+        current_market = None
+        if bot.is_btc_1h_only:
+            hourly_markets = getattr(bot.market, '_hourly_markets', [])
+            if hourly_markets:
+                active = [m for m in hourly_markets if m.get('hours_until', -1) >= 0]
+                if active:
+                    m = active[0]
+                    current_market = {
+                        "title": m.get("title", "")[:60],
+                        "status": "IN_WINDOW" if m.get('in_window') else "UPCOMING",
+                        "minutes_left": m.get('minutes_left'),
+                        "minutes_to_start": m.get('minutes_to_start'),
+                        "accepting_orders": m.get('accepting_orders', False),
+                    }
+        
         data = {
             "mode": bot.config.get("MODE", "?"),
+            "bot_mode": bot.config.get("BOT_MODE", "FULL"),
             "running": bot.running,
             "uptime_seconds": round(time.time() - bot._start_time, 0),
             "markets_watching": total_markets,
@@ -92,6 +109,7 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
             "rotation_pct": rotation_pct,
             "hot_markets": hot_count,
             "snapshots": bot.collector._snap_count,
+            "current_market": current_market,
         }
 
         if pe:
@@ -169,27 +187,67 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"trades": pe.get_trade_history(limit=100)})
 
     def _api_markets(self):
+        """Show only 1H BTC Up/Down markets - filtered by duration in market.py"""
         bot = self.server.bot_ref
-        heat = bot._market_heat
-
-        # Show hottest markets (closest to arb) instead of first 10
-        if heat:
-            hot_sorted = sorted(heat.items(), key=lambda x: x[1])[:15]
+        
+        # Use hourly markets discovered by market.py (filtered by duration 50-70 min)
+        hourly_markets = getattr(bot.market, '_hourly_markets', [])
+        
+        if hourly_markets:
+            # Show 1H BTC markets with duration info and status fields
             market_list = []
-            for cid, overround in hot_sorted:
+            for m in hourly_markets:
+                hours_until = m.get('hours_until', 0)
+                in_window = m.get('in_window', False)
+                minutes_left = m.get('minutes_left')
+                minutes_to_start = m.get('minutes_to_start')
+                
+                # Determine status
+                if hours_until < 0:
+                    status = "RESOLVED"
+                elif in_window:
+                    status = "IN_WINDOW"
+                else:
+                    status = "UPCOMING"
+                
                 market_list.append({
-                    "condition_id": cid[:20] + "...",
-                    "overround": round(overround, 4),
-                    "status": "ARB" if overround < 0 else "NEAR" if overround < 0.01 else "WATCH",
+                    "condition_id": m.get("condition_id", "")[:20] + "...",
+                    "title": m.get("title", "")[:60],
+                    "duration_min": m.get("duration_min", 0),
+                    "resolves_in_hours": round(hours_until, 1) if hours_until >= 0 else "RESOLVED",
+                    "yes_price": m.get("yes_price", 0),
+                    "no_price": m.get("no_price", 0),
+                    "accepting_orders": m.get("accepting_orders", False),
+                    "in_window": in_window,
+                    "minutes_left": minutes_left,
+                    "minutes_to_start": minutes_to_start,
+                    "status": status,
                 })
+            self._send_json({
+                "markets": market_list,
+                "total_tracked": len(market_list),
+                "filter": "1H BTC Up/Down only (duration-based)"
+            })
         else:
-            market_list = [
-                {"condition_id": m.get("condition_id", "")[:20] + "...",
-                 "overround": round(m.get("yes_price", 0) + m.get("no_price", 0) - 1.0, 4),
-                 "status": "SCANNING"}
-                for m in bot._current_markets[:15]
-            ]
-        self._send_json({"markets": market_list, "total_tracked": len(heat)})
+            # Fallback to current markets if no hourly markets found
+            heat = bot._market_heat
+            if heat:
+                hot_sorted = sorted(heat.items(), key=lambda x: x[1])[:15]
+                market_list = []
+                for cid, overround in hot_sorted:
+                    market_list.append({
+                        "condition_id": cid[:20] + "...",
+                        "overround": round(overround, 4),
+                        "status": "ARB" if overround < 0 else "NEAR" if overround < 0.01 else "WATCH",
+                    })
+            else:
+                market_list = [
+                    {"condition_id": m.get("condition_id", "")[:20] + "...",
+                     "overround": round(m.get("yes_price", 0) + m.get("no_price", 0) - 1.0, 4),
+                     "status": "SCANNING"}
+                    for m in bot._current_markets[:15]
+                ]
+            self._send_json({"markets": market_list, "total_tracked": len(heat), "filter": "ALL"})
 
     def _api_risk(self):
         bot = self.server.bot_ref
