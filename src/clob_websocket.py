@@ -242,27 +242,36 @@ class CLOBWebSocketMonitor:
         """
         Update market metadata cache.
         
-        Fetches clobTokenIds from Gamma API for proper WebSocket subscription.
-        This is the key fix: use Gamma's clobTokenIds instead of py_clob_client token_ids.
+        Uses token IDs from market.py (yes_token_id, no_token_id) for WebSocket subscription.
+        These are the CLOB token IDs that work with the WebSocket.
         """
-        # First, try to enhance with Gamma API data
-        self._fetch_clob_token_ids_from_gamma(markets)
+        # Skip Gamma API call - use existing token IDs from market.py
+        # The market.py already has the correct yes_token_id and no_token_id
+        
+        print(f"[CLOB] DEBUG update_market_cache: received {len(markets)} markets")
         
         with self._cache_lock:
             self._market_cache = {}
-            for m in markets:
+            for i, m in enumerate(markets):
                 cid = m.get("condition_id", "")
-                if cid:
+                yes_token = m.get("yes_token_id")
+                no_token = m.get("no_token_id")
+                
+                if i < 3:
+                    print(f"[CLOB] DEBUG market {i}: cid={cid[:20] if cid else 'NONE'}... yes_token={yes_token[:20] if yes_token else 'NONE'}...")
+                
+                if cid and yes_token and no_token:
                     self._market_cache[cid] = {
                         "condition_id": cid,
                         "title": m.get("title", ""),
-                        "yes_token_id": m.get("yes_token_id"),
-                        "no_token_id": m.get("no_token_id"),
-                        # Include clobTokenIds if available from Gamma
-                        "yes_clob_token_id": m.get("yes_clob_token_id"),
-                        "no_clob_token_id": m.get("no_clob_token_id"),
+                        "yes_token_id": yes_token,
+                        "no_token_id": no_token,
+                        # Use these as fallback for WebSocket subscription
+                        "yes_clob_token_id": yes_token,
+                        "no_clob_token_id": no_token,
                     }
-        print(f"[CLOB] Market cache updated: {len(self._market_cache)} markets")
+        
+        print(f"[CLOB] Market cache updated: {len(self._market_cache)} markets (using token IDs from market.py)")
 
     def _fetch_clob_token_ids_from_gamma(self, markets):
         """

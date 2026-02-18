@@ -132,6 +132,9 @@ class HealthMonitor:
 
             issues = []
 
+            # Check if in BTC_1H_ONLY mode (skip whale/copy/blockchain checks)
+            is_btc_1h_only = self.config.get("BOT_MODE") == "BTC_1H_ONLY"
+
             # Check 1: Main loop heartbeat
             heartbeat_age = now - self.liveness["main_loop_heartbeat"]
             if heartbeat_age > self.thresholds["main_loop_timeout_sec"]:
@@ -142,36 +145,44 @@ class HealthMonitor:
                     "action": "emergency_state_save",
                 })
 
-            # Check 2: Blockchain monitor stall
-            if self.bot and hasattr(self.bot, 'blockchain_monitor') and self.bot.blockchain_monitor:
-                block_age = now - self.liveness["blockchain_last_block"]
-                if block_age > self.thresholds["blockchain_stall_sec"]:
-                    issues.append({
-                        "severity": "HIGH",
-                        "component": "blockchain_monitor",
-                        "issue": f"No blocks for {block_age:.0f}s",
-                        "action": "force_reconnect",
-                    })
+            # Skip blockchain and whale checks in BTC_1H_ONLY mode
+            if not is_btc_1h_only:
+                # Check 2: Blockchain monitor stall
+                if self.bot and hasattr(self.bot, 'blockchain_monitor') and self.bot.blockchain_monitor:
+                    block_age = now - self.liveness["blockchain_last_block"]
+                    if block_age > self.thresholds["blockchain_stall_sec"]:
+                        issues.append({
+                            "severity": "HIGH",
+                            "component": "blockchain_monitor",
+                            "issue": f"No blocks for {block_age:.0f}s",
+                            "action": "force_reconnect",
+                        })
 
-            # Check 3: Blockchain event drought (might be legit, just warn)
-            event_age = now - self.liveness["blockchain_last_event"]
-            if event_age > self.thresholds["blockchain_event_drought_sec"]:
-                issues.append({
-                    "severity": "MEDIUM",
-                    "component": "blockchain_monitor",
-                    "issue": f"No events for {event_age/60:.0f} minutes",
-                    "action": "monitor",
-                })
+                # Check 3: Blockchain event drought (might be legit, just warn)
+                # Only check if we have a valid timestamp (not 0/None)
+                blockchain_last_event = self.liveness.get("blockchain_last_event", 0)
+                if blockchain_last_event > 0:
+                    event_age = now - blockchain_last_event
+                    if event_age > self.thresholds["blockchain_event_drought_sec"]:
+                        issues.append({
+                            "severity": "MEDIUM",
+                            "component": "blockchain_monitor",
+                            "issue": f"No events for {event_age/60:.0f} minutes",
+                            "action": "monitor",
+                        })
 
-            # Check 4: Signal drought (might be legit market conditions)
-            signal_age = now - self.liveness["whale_last_signal"]
-            if signal_age > self.thresholds["signal_drought_sec"]:
-                issues.append({
-                    "severity": "LOW",
-                    "component": "whale_tracker",
-                    "issue": f"No signals for {signal_age/3600:.1f} hours",
-                    "action": "monitor",
-                })
+                # Check 4: Signal drought (might be legit market conditions)
+                # Only check if we have a valid timestamp (not 0/None)
+                whale_last_signal = self.liveness.get("whale_last_signal", 0)
+                if whale_last_signal > 0:
+                    signal_age = now - whale_last_signal
+                    if signal_age > self.thresholds["signal_drought_sec"]:
+                        issues.append({
+                            "severity": "LOW",
+                            "component": "whale_tracker",
+                            "issue": f"No signals for {signal_age/3600:.1f} hours",
+                            "action": "monitor",
+                        })
 
             # Check 5: State file corruption (basic check)
             state_check = self._check_state_files()
@@ -273,12 +284,20 @@ class HealthMonitor:
 
     def _check_state_files(self):
         """Check if critical state files exist and are readable."""
+        # In BTC_1H_ONLY mode, skip whale_state.json and wallet_scores.json
+        is_btc_1h_only = self.config.get("BOT_MODE") == "BTC_1H_ONLY"
+        
         critical_files = [
             "data/paper_state.json",
             "data/risk_state.json",
-            "data/whale_state.json",
-            "data/wallet_scores.json",
         ]
+        
+        # Only check whale/wallet files in FULL mode
+        if not is_btc_1h_only:
+            critical_files.extend([
+                "data/whale_state.json",
+                "data/wallet_scores.json",
+            ])
 
         for filepath in critical_files:
             if not os.path.exists(filepath):

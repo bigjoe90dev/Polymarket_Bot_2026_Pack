@@ -89,8 +89,23 @@ class TradingBot:
             config=config,
             is_btc_1h_only=self.is_btc_1h_only,
         )
+        
+        # BTC_1H_ONLY mode: Enable CLOB WebSocket for REAL-TIME prices (momentum needs sub-second updates!)
+        if self.is_btc_1h_only and config.get("USE_CLOB_WEBSOCKET", True):
+            # Create a simple callback that feeds prices to momentum strategy
+            def on_price_update(token_id, price):
+                if self.momentum_strategy:
+                    self.momentum_strategy.on_price_update(token_id, price, source="ws")
+            
+            try:
+                self.clob_websocket = CLOBWebSocketMonitor(config, on_price_update)
+                print("[*] CLOB WebSocket initialized for REAL-TIME prices (momentum strategy)")
+            except Exception as e:
+                print(f"[!] CLOB WebSocket failed to initialize: {e}")
+                self.clob_websocket = None
+        
         if self.is_btc_1h_only:
-            print("[*] Momentum strategy initialized (BTC_1H_ONLY mode - NO whale/copy systems)")
+            print("[*] Momentum strategy initialized (BTC_1H_ONLY mode)")
         else:
             print("[*] Momentum strategy initialized (1H trend-following, WS + REST fallback)")
 
@@ -157,9 +172,16 @@ class TradingBot:
             else:
                 print(f"[*] Registered {registered_count}/{len(markets)} markets with momentum strategy (filtered by 1H Up/Down crypto)")
 
-        # BTC_1H_ONLY mode: Skip all whale/copy trading systems
+        # BTC_1H_ONLY mode: Skip whale/copy systems but START CLOB WebSocket for real-time prices
         if self.is_btc_1h_only:
-            print("[*] BTC_1H_ONLY: Skipping whale tracker, blockchain monitor, CLOB websocket")
+            # Start CLOB WebSocket for real-time prices (momentum needs sub-second updates!)
+            if self.clob_websocket:
+                print(f"[*] DEBUG: Passing {len(markets)} markets to WebSocket, first market cid: {markets[0].get('condition_id', 'NONE') if markets else 'EMPTY'}")
+                self.clob_websocket.update_market_cache(markets)
+                self.clob_websocket.start()
+                print(f"[*] CLOB WebSocket started for REAL-TIME prices (momentum strategy)")
+            else:
+                print("[*] BTC_1H_ONLY: Using REST polling for prices (CLOB WebSocket not available)")
         else:
             # FULL mode: Initialize whale systems
             print("[*] Discovering profitable traders from leaderboard...")
@@ -316,13 +338,9 @@ class TradingBot:
                         self._ws_healthy = False
                         print("[*] WS unhealthy for 60s, using REST polling fallback")
                 
-                # Use REST polling if WS is not healthy
-                if not ws_healthy and self.clob_websocket is None:
-                    # WS disabled entirely - use REST polling
-                    self.momentum_strategy.poll_prices(self.market, source="rest")
-                elif not ws_healthy and self.clob_websocket:
-                    # WS enabled but not connected - use REST polling
-                    self.momentum_strategy.poll_prices(self.market, source="rest")
+                # Always use REST polling as fallback (runs every cycle)
+                # This ensures price buffers are updated even if WS is having issues
+                self.momentum_strategy.poll_prices(self.market, source="rest")
                 
                 # Check exit conditions for open positions
                 self.momentum_strategy.check_exits()

@@ -48,8 +48,14 @@ class MarketDataService:
             day = today + timedelta(days=day_offset)
             month_name = MONTHS[day.month - 1]
             
-            # Generate hours 8AM-11PM ET (1PM-4AM UTC next day)
-            for hour in range(8, 24):
+            # Generate hours 8AM-11PM ET
+            # AM markets: 8am, 9am, 10am, 11am
+            for hour in range(8, 12):
+                slug = f'bitcoin-up-or-down-{month_name}-{day.day}-{hour}am-et'
+                slugs.append(slug)
+            
+            # PM markets: 12pm, 1pm, 2pm, ... 11pm
+            for hour in range(12, 24):
                 slug = f'bitcoin-up-or-down-{month_name}-{day.day}-{hour}pm-et'
                 slugs.append(slug)
         
@@ -255,17 +261,76 @@ class MarketDataService:
             print(f"[*] No active markets - waiting for next hourly market")
         print()
 
+    def refresh_market_times(self):
+        """Refresh time status (minutes_left, in_window) for existing markets.
+        This is called periodically to keep time tracking accurate without re-fetching from API."""
+        if not self._hourly_markets:
+            return
+        
+        now = datetime.now(timezone.utc)
+        refreshed = []
+        
+        for market in self._hourly_markets:
+            start_time = market.get('start_time', '')
+            end_date = market.get('end_date', '')
+            
+            try:
+                # Parse times
+                if start_time:
+                    start_time_clean = start_time.replace('Z', '+00:00')
+                    if '.' in start_time_clean:
+                        start_time_clean = start_time_clean.split('.')[0] + '+00:00'
+                    start_dt = datetime.fromisoformat(start_time_clean)
+                else:
+                    start_dt = None
+                    
+                if end_date:
+                    end_date_clean = end_date.replace('Z', '+00:00')
+                    if '.' in end_date_clean:
+                        end_date_clean = end_date_clean.split('.')[0] + '+00:00'
+                    end_dt = datetime.fromisoformat(end_date_clean)
+                else:
+                    end_dt = None
+                
+                # Recalculate time status
+                minutes_left = None
+                minutes_to_start = None
+                in_window = False
+                
+                if start_dt and end_dt:
+                    if start_dt <= now <= end_dt:
+                        in_window = True
+                        minutes_left = int((end_dt - now).total_seconds() / 60)
+                    elif now < start_dt:
+                        minutes_to_start = int((start_dt - now).total_seconds() / 60)
+                
+                # Update market with refreshed times
+                market['in_window'] = in_window
+                market['minutes_left'] = minutes_left
+                market['minutes_to_start'] = minutes_to_start
+                refreshed.append(market)
+                
+            except Exception:
+                # Keep original values if parsing fails
+                refreshed.append(market)
+        
+        self._hourly_markets = refreshed
+    
     def get_active_markets(self):
         """Spec 6.2: Pulls active markets (YES/NO only).
         Uses dynamic 1H discovery if enabled in config.
         
-        Returns only markets that are not yet resolved (hours_until >= 0)."""
+        Returns only markets that are not yet resolved (hours_until >= 0).
+        Also refreshes time status for existing markets."""
         
         use_hourly = self.config.get("USE_HOURLY_MARKETS", False)
         
         if use_hourly:
-            # Dynamically discover 1H markets
+            # Dynamically discover 1H markets (only on first call)
             self._discover_hourly_markets()
+            
+            # Refresh time status for existing markets (call every time)
+            self.refresh_market_times()
             
             if self._hourly_markets:
                 # Filter out resolved markets - only return active ones
