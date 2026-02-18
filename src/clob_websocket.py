@@ -260,9 +260,12 @@ class CLOBWebSocketMonitor:
                 if i < 3:
                     print(f"[CLOB] DEBUG market {i}: cid={cid[:20] if cid else 'NONE'}... yes_token={yes_token[:20] if yes_token else 'NONE'}...")
                 
-                if cid and yes_token and no_token:
-                    self._market_cache[cid] = {
-                        "condition_id": cid,
+                # Use condition_id if available, otherwise use yes_token as key
+                cache_key = cid if cid else yes_token
+                
+                if cache_key and yes_token and no_token:
+                    self._market_cache[cache_key] = {
+                        "condition_id": cid if cid else cache_key,
                         "title": m.get("title", ""),
                         "yes_token_id": yes_token,
                         "no_token_id": no_token,
@@ -467,6 +470,19 @@ class CLOBWebSocketMonitor:
         if not isinstance(data, dict):
             return
 
+        # DIAGNOSTIC: Print raw message once to understand format
+        if hasattr(self, '_raw_msg_printed'):
+            self._raw_msg_printed += 1
+        else:
+            self._raw_msg_printed = 1
+        
+        if self._raw_msg_printed == 1:
+            print(f"\n[CLOB RAW] First message payload:")
+            import json
+            print(json.dumps(data, indent=2)[:2000])
+            print(f"[CLOB RAW] Keys found: {list(data.keys())}")
+            print("[CLOB RAW] End payload\n")
+
         # FIXED: Route by event_type as per Polymarket docs
         # - "book" = order book snapshot (bids/asks as objects)
         # - "price_change" = price level updates
@@ -530,7 +546,15 @@ class CLOBWebSocketMonitor:
                 self.order_book.update_ask(market, float(price), float(size))
         
         self._last_book_update[market] = time.time()
-        print(f"[CLOB] Book snapshot: {market[:20]}... bids={len(bids)}, asks={len(asks)}")
+        
+        # Only log first 5 snapshots to reduce spam, then only log periodically
+        snapshot_count = getattr(self, '_snapshot_log_count', 0)
+        if snapshot_count < 5:
+            print(f"[CLOB] Book snapshot: {market[:20]}... bids={len(bids)}, asks={len(asks)}")
+            self._snapshot_log_count = snapshot_count + 1
+        elif snapshot_count == 5:
+            print(f"[CLOB] ... (suppressing further snapshot logs for cleanliness)")
+            self._snapshot_log_count = snapshot_count + 1
 
     async def _handle_price_change(self, data: Dict):
         """Handle price_change event.
@@ -555,7 +579,21 @@ class CLOBWebSocketMonitor:
             best_bid = float(change.get("best_bid", 0))
             best_ask = float(change.get("best_ask", 0))
             
-            if not asset_id or not price:
+            if not asset_id:
+                continue
+            
+            # FALLBACK: If no price in message, try best_bid/best_ask mid
+            if not price and best_bid > 0 and best_ask > 0:
+                price = (best_bid + best_ask) / 2
+                # Also print diagnostic for this case
+                if hasattr(self, '_mid_price_fallback_count'):
+                    self._mid_price_fallback_count += 1
+                else:
+                    self._mid_price_fallback_count = 1
+                if self._mid_price_fallback_count <= 3:
+                    print(f"[CLOB FALLBACK] Using mid price: best_bid={best_bid}, best_ask={best_ask} -> price={price}")
+            
+            if not price:
                 continue
             
             # Update order book with best bid/ask
@@ -575,6 +613,15 @@ class CLOBWebSocketMonitor:
             # Call momentum callback if registered
             if self.price_callback:
                 try:
+                    # DEBUG: Print first few price updates to diagnose
+                    if hasattr(self, '_price_callback_count'):
+                        self._price_callback_count += 1
+                    else:
+                        self._price_callback_count = 1
+                    
+                    if self._price_callback_count <= 3:
+                        print(f"[CLOB CALLBACK] asset_id={asset_id[:30]}... price={price}")
+                    
                     self.price_callback(asset_id, price)
                 except Exception as e:
                     print(f"[CLOB] Callback error: {e}")

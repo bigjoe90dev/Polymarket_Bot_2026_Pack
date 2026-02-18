@@ -452,6 +452,15 @@ class TrendStrategy:
         Note: WS price is the last_trade_price from CLOB, which is a trade-weighted
         price. This is appropriate for momentum signals.
         """
+        # DEBUG: Heartbeat to diagnose price update flow
+        # Print no more than once every 5 seconds
+        now = time.time()
+        last_debug = getattr(self, '_last_price_debug', 0)
+        if now - last_debug > 5:
+            buffer_len = len(self.tracker.price_buffers.get(token_id, []))
+            print(f"[PRICE DEBUG] token={token_id[:20]}... price={price} buffer_len={buffer_len}")
+            self._last_price_debug = now
+        
         self.tracker.update_price(token_id, price, source)
         self._process_signals(token_id)
     
@@ -1011,16 +1020,18 @@ class TrendStrategy:
         
         self.decisions_log.append(decision)
         
-        # Also log to console (None-safe formatting)
-        time_left_str = f"{time_left:.1f}" if time_left is not None else "N/A"
-        price_str = f"${price:.2f}" if price is not None else "$0.00"
-        trend_str = f"{trendiness:.2f}" if trendiness is not None else "0.00"
-        conf_str = f"{confidence:.2f}" if confidence is not None else "0.00"
-        
-        print(f"[TREND] {action} | {asset} | 1H | {market_name[:30]}... | "
-              f"price={price_str} | trend={trend_str} | breakout={breakout} | "
-              f"time_left={time_left_str}min[{time_left_source}] | conf={conf_str} | "
-              f"tick=${tick_size:.4f} | {reason}")
+        # Only log to console for actual trade decisions, not for every SKIP
+        # This reduces spam significantly
+        if action in ("ENTER_YES", "ENTER_NO", "EXIT"):
+            time_left_str = f"{time_left:.1f}" if time_left is not None else "N/A"
+            price_str = f"${price:.2f}" if price is not None else "$0.00"
+            trend_str = f"{trendiness:.2f}" if trendiness is not None else "0.00"
+            conf_str = f"{confidence:.2f}" if confidence is not None else "0.00"
+            
+            print(f"[TREND] {action} | {asset} | 1H | {market_name[:30]}... | "
+                  f"price={price_str} | trend={trend_str} | breakout={breakout} | "
+                  f"time_left={time_left_str}min[{time_left_source}] | conf={conf_str} | "
+                  f"tick=${tick_size:.4f} | {reason}")
     
     def _verify_tick_size(self, token_id: str) -> float:
         """Verify tick size from observed price deltas.

@@ -132,8 +132,8 @@ class MarketDataService:
                     now = datetime.now(timezone.utc)
                     hours_until = (end_dt - now).total_seconds() / 3600
                     
-                    # Accept markets that resolve in next 12 hours (for trading)
-                    if hours_until < -1:  # Already resolved
+                    # Skip markets that have already resolved (expired)
+                    if hours_until < 0:
                         continue
                     
                     # Get token info from Gamma response
