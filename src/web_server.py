@@ -96,6 +96,10 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
                         "minutes_left": m.get('minutes_left'),
                         "minutes_to_start": m.get('minutes_to_start'),
                         "accepting_orders": m.get('accepting_orders', False),
+                        "yes_price": m.get('yes_price', 0),
+                        "no_price": m.get('no_price', 0),
+                        "price_source": m.get('price_source', 'unknown'),
+                        "last_update_time": m.get('last_update_time', ''),
                     }
         
         data = {
@@ -217,6 +221,8 @@ class RetroRequestHandler(BaseHTTPRequestHandler):
                     "resolves_in_hours": round(hours_until, 1) if hours_until >= 0 else "RESOLVED",
                     "yes_price": m.get("yes_price", 0),
                     "no_price": m.get("no_price", 0),
+                    "price_source": m.get("price_source", "unknown"),
+                    "last_update_time": m.get("last_update_time", ""),
                     "accepting_orders": m.get("accepting_orders", False),
                     "in_window": in_window,
                     "minutes_left": minutes_left,

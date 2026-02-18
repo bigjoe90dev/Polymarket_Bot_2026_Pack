@@ -397,9 +397,11 @@ class TrendStrategy:
         no_token_id: str,
         market_name: str = "",
         end_date: str = None,
-        timeframe: str = ""
+        timeframe: str = "",
+        yes_price: float = 0.5,
+        no_price: float = 0.5
     ) -> bool:
-        """Register a market with its token IDs.
+        """Register a market with its token IDs and prices.
         Returns True if market was registered, False if filtered out."""
         
         # BTC_1H_ONLY mode: Trust market.py's filtering - accept all markets passed in
@@ -414,6 +416,8 @@ class TrendStrategy:
             "title": market_name,
             "end_date": end_date,  # THIS IS CRITICAL FOR TIME-LEFT GATE
             "timeframe": timeframe or "1h",
+            "yes_price": yes_price,
+            "no_price": no_price,
         }
         
         # Register both YES and NO tokens
@@ -423,6 +427,7 @@ class TrendStrategy:
             "no_token_id": no_token_id,
             "outcome": "YES",
             "market_name": market_name,
+            "price": yes_price,
         }
         self.token_to_market[no_token_id] = {
             "condition_id": condition_id,
@@ -430,7 +435,14 @@ class TrendStrategy:
             "no_token_id": no_token_id,
             "outcome": "NO",
             "market_name": market_name,
+            "price": no_price,
         }
+        
+        # Initialize price in tracker if valid
+        if yes_price and yes_price > 0:
+            self.tracker.update_price(yes_token_id, yes_price, "init")
+        if no_price and no_price > 0:
+            self.tracker.update_price(no_token_id, no_price, "init")
         
         return True
     
@@ -446,11 +458,10 @@ class TrendStrategy:
     def poll_prices(self, market_service, source: str = "rest"):
         """Poll prices from REST API (fallback mode).
         
-        Uses MarketDataService.get_order_book() to get mid-price from order book.
-        Mid-price = (best_bid + best_ask) / 2
+        For BTC_1H_ONLY mode: Uses prices from Gamma API (already in market_metadata).
+        For FULL mode: Uses CLOB REST to get current prices.
         
-        This ensures consistency with WS mode - both use the best available
-        price from the order book (WS uses last_trade, REST uses mid-price).
+        This ensures we have valid prices for trend following.
         """
         now = time.time()
         
@@ -463,61 +474,102 @@ class TrendStrategy:
         # Get prices for registered markets
         for token_id, market_info in self.token_to_market.items():
             try:
-                # Get order book to calculate mid-price
-                # We need the condition_id to fetch the order book
-                condition_id = market_info.get("condition_id")
-                if not condition_id:
-                    continue
+                # First, try to use stored price from Gamma API (already fetched at startup)
+                outcome = market_info.get("outcome")
+                stored_price = market_info.get("price", 0)
                 
-                # Find market in current markets (need full market info)
-                # This is a limitation - in fallback mode, we need market context
-                # For now, use the yes_price/no_price from registration if available
-                if outcome == "YES":
-                    price = self.tracker.last_prices.get(token_id, (None, None))[0]
-                else:
-                    price = self.tracker.last_prices.get(token_id, (None, None))[0]
+                price = None
                 
-                # Fallback: try to get from market service's cached prices
-                if hasattr(market_service, 'client'):
-                    try:
-                        # Try direct token price fetch
-                        # This uses the CLOB API to get current price
-                        resp = market_service.client.get_markets(token=token_id)
-                        if resp and len(resp) > 0:
-                            price = float(resp[0].get("price", 0))
-                    except:
-                        pass
+                # Use stored Gamma API price if valid
+                if stored_price and stored_price > 0:
+                    price = stored_price
                 
+                # If BTC_1H_ONLY mode, prefer Gamma API prices (already fetched)
+                # If FULL mode or Gamma price is 0, try CLOB REST
+                if not price or price == 0:
+                    if hasattr(market_service, 'client'):
+                        try:
+                            # Try direct token price fetch from CLOB
+                            resp = market_service.client.get_markets(token=token_id)
+                            if resp and len(resp) > 0:
+                                price = float(resp[0].get("price", 0))
+                        except:
+                            pass
+                
+                # Update tracker if we have a valid price
                 if price and price > 0:
                     self.tracker.update_price(token_id, price, source)
             except Exception as e:
                 # Log but continue
                 pass  # Suppress noisy logging
         
+        # Get market status for BTC_1H_ONLY mode
+        market_status = None
+        if self.is_btc_1h_only and hasattr(market_service, '_hourly_markets'):
+            hourly_markets = market_service._hourly_markets
+            if hourly_markets:
+                # Get first active market
+                active = [m for m in hourly_markets if m.get('hours_until', -1) >= 0]
+                if active:
+                    m = active[0]
+                    market_status = {
+                        'in_window': m.get('in_window', False),
+                        'accepting_orders': m.get('accepting_orders', False),
+                        'minutes_left': m.get('minutes_left'),
+                        'minutes_to_start': m.get('minutes_to_start'),
+                    }
+        
         # Process signals for all tokens
         for token_id in self.token_to_market:
-            self._process_signals(token_id)
+            self._process_signals(token_id, market_status=market_status)
     
-    def _process_signals(self, token_id: str):
-        """Process signals for a token. Called after price update."""
+    def _process_signals(self, token_id: str, market_status: dict = None):
+        """Process signals for a token. Called after price update.
+        
+        Args:
+            token_id: The token to process
+            market_status: Optional dict with in_window, accepting_orders, minutes_left
+        """
         with self._lock:
             market = self.token_to_market.get(token_id)
             if not market:
                 return
             
+            # BTC_1H_ONLY: Check market window status first
+            # Only evaluate when in_window=true AND accepting_orders=true AND minutes_left>=ENTRY_CUTOFF
+            if self.is_btc_1h_only and market_status:
+                in_window = market_status.get('in_window', False)
+                accepting_orders = market_status.get('accepting_orders', False)
+                minutes_left = market_status.get('minutes_left')
+                entry_cutoff = self.config.get('TREND_TIME_LEFT_THRESHOLD', 5)  # Default 5 min
+                
+                if not in_window:
+                    # Market not in trading window - skip silently (reduce log spam)
+                    return
+                
+                if not accepting_orders:
+                    # Market not accepting orders - skip silently
+                    return
+                
+                if minutes_left is not None and minutes_left < entry_cutoff:
+                    # Too close to expiry - skip
+                    return
+            
             # Layer 0: Data sanity check
             is_sane, sanity_reason = self.tracker.is_data_sane(token_id)
             if not is_sane:
-                self._log_decision(
-                    action="SKIP",
-                    token_id=token_id,
-                    market=market,
-                    reason=f"LAYER0:{sanity_reason}",
-                    trendiness=0.0,
-                    breakout="N/A",
-                    time_left=None,
-                    confidence=0.0
-                )
+                # In BTC_1H_ONLY mode, suppress LAYER0 logs when UPCOMING to reduce spam
+                if not (self.is_btc_1h_only and market_status and not market_status.get('in_window', False)):
+                    self._log_decision(
+                        action="SKIP",
+                        token_id=token_id,
+                        market=market,
+                        reason=f"LAYER0:{sanity_reason}",
+                        trendiness=0.0,
+                        breakout="N/A",
+                        time_left=None,
+                        confidence=0.0
+                    )
                 return
             
             # Get current price and time left
@@ -554,11 +606,13 @@ class TrendStrategy:
             # Layer 1: Regime filter (trendiness)
             trendiness = self.tracker.compute_trendiness(token_id)
             if trendiness < self.tracker.trendiness_threshold:
+                # None-safe formatting
+                trend_str = f"{trendiness:.2f}" if trendiness is not None else "N/A"
                 self._log_decision(
                     action="SKIP",
                     token_id=token_id,
                     market=market,
-                    reason=f"LAYER1:Trendiness={trendiness:.2f}<{self.tracker.trendiness_threshold}",
+                    reason=f"LAYER1:Trendiness={trend_str}<{self.tracker.trendiness_threshold}",
                     trendiness=trendiness,
                     breakout="N/A",
                     time_left=time_left,
@@ -642,11 +696,13 @@ class TrendStrategy:
             
             # Confidence threshold: do nothing when unsure
             if confidence < self.tracker.confidence_threshold:
+                # None-safe formatting
+                conf_str = f"{confidence:.2f}" if confidence is not None else "N/A"
                 self._log_decision(
                     action="SKIP",
                     token_id=token_id,
                     market=market,
-                    reason=f"CONFIDENCE={confidence:.2f}<{self.tracker.confidence_threshold}",
+                    reason=f"CONFIDENCE={conf_str}<{self.tracker.confidence_threshold}",
                     trendiness=trendiness,
                     breakout=breakout_direction,
                     time_left=time_left,
@@ -685,12 +741,13 @@ class TrendStrategy:
             end_date = self.market_metadata[condition_id].get("end_date")
         time_left, time_left_source = self.tracker.parse_time_left(market_name, end_date)
         
-        # Log the decision
+        # Log the decision (None-safe)
+        conf_str = f"{confidence:.2f}" if confidence is not None else "N/A"
         self._log_decision(
             action=action,
             token_id=token_id,
             market=market,
-            reason=f"ENTRY:Conf={confidence:.2f}",
+            reason=f"ENTRY:Conf={conf_str}",
             trendiness=self.tracker.compute_trendiness(token_id),
             breakout="LONG" if outcome == "YES" else "SHORT",
             time_left=time_left,
@@ -736,8 +793,11 @@ class TrendStrategy:
                     )
                     self.tracker.positions[condition_id] = position
                     
-                    print(f"[TREND] 🎯 {action} @ ${price:.2f} "
-                          f"confidence={confidence:.2f} on {market_name[:40]}...")
+                    # None-safe formatting
+                    price_str = f"${price:.2f}" if price is not None else "$0.00"
+                    conf_str = f"{confidence:.2f}" if confidence is not None else "0.00"
+                    print(f"[TREND] 🎯 {action} @ {price_str} "
+                          f"confidence={conf_str} on {market_name[:40]}...")
                 else:
                     reason = result.get("reason", "unknown") if result else "null_result"
                     print(f"[TREND] ⚠️ Trade rejected: {reason} - {market_name[:40]}...")
@@ -815,8 +875,10 @@ class TrendStrategy:
             from src.paper_fees import calculate_trading_fee
             fee = calculate_trading_fee(fill_result["fill_price"], fill_result["fill_size"], yes_fee_bps)
             
-            print(f"[TREND] 📝 Paper Trade: {outcome} @ signal=${price:.3f} -> fill=${fill_result['fill_price']:.3f} "
-                  f"(spread=${abs(fill_result['fill_price']-price):.4f}) fee=${fee:.4f}")
+            # None-safe formatting
+            price_str = f"${price:.3f}" if price is not None else "$0.000"
+            print(f"[TREND] 📝 Paper Trade: {outcome} @ signal={price_str} -> fill=${fill_result['fill_price']:.3f} "
+                  f"(spread=${abs(fill_result['fill_price']-(price or 0)):.4f}) fee=${fee:.4f}")
             
             # Return success - actual position recording happens in paper_engine
             return {
@@ -886,7 +948,7 @@ class TrendStrategy:
                 "market_name": position.market_name,
                 "outcome": position.outcome
             },
-            reason=f"{reason}:PnL={pnl_ticks:.1f}Ticks",
+            reason=f"{reason}:PnL={pnl_ticks:.1f}Ticks" if pnl_ticks is not None else f"{reason}:PnL=N/A",
             trendiness=0.0,
             breakout="N/A",
             time_left=None,
@@ -896,8 +958,11 @@ class TrendStrategy:
         # Remove position from tracker
         del self.tracker.positions[position.condition_id]
         
-        print(f"[TREND] 🏁 EXIT {position.outcome} @ ${current_price:.2f} "
-              f"{reason} PnL={pnl_ticks:.1f} ticks on {position.market_name[:40]}...")
+        # None-safe formatting
+        price_str = f"${current_price:.2f}" if current_price is not None else "$0.00"
+        pnl_str = f"{pnl_ticks:.1f}" if pnl_ticks is not None else "N/A"
+        print(f"[TREND] 🏁 EXIT {position.outcome} @ {price_str} "
+              f"{reason} PnL={pnl_str} ticks on {position.market_name[:40]}...")
     
     def _log_decision(
         self,
@@ -946,10 +1011,15 @@ class TrendStrategy:
         
         self.decisions_log.append(decision)
         
-        # Also log to console
+        # Also log to console (None-safe formatting)
+        time_left_str = f"{time_left:.1f}" if time_left is not None else "N/A"
+        price_str = f"${price:.2f}" if price is not None else "$0.00"
+        trend_str = f"{trendiness:.2f}" if trendiness is not None else "0.00"
+        conf_str = f"{confidence:.2f}" if confidence is not None else "0.00"
+        
         print(f"[TREND] {action} | {asset} | 1H | {market_name[:30]}... | "
-              f"price=${price:.2f} | trend={trendiness:.2f} | breakout={breakout} | "
-              f"time_left={time_left:.1f}min[{time_left_source}] | conf={confidence:.2f} | "
+              f"price={price_str} | trend={trend_str} | breakout={breakout} | "
+              f"time_left={time_left_str}min[{time_left_source}] | conf={conf_str} | "
               f"tick=${tick_size:.4f} | {reason}")
     
     def _verify_tick_size(self, token_id: str) -> float:

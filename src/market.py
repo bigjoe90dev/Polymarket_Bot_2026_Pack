@@ -140,11 +140,23 @@ class MarketDataService:
                     yes_token_id = token_ids[0]
                     no_token_id = token_ids[1]
                     
-                    # Get current prices from order book or use default
-                    # For now, use outcomePrices if available
-                    outcome_prices = json.loads(result.get('outcomePrices', '["0.5", "0.5"]'))
-                    yes_price = float(outcome_prices[0]) if len(outcome_prices) > 0 else 0.5
-                    no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else 0.5
+                    # Get current prices - determine source
+                    # Try Gamma API first (outcomePrices)
+                    outcome_prices = json.loads(result.get('outcomePrices', '[]'))
+                    price_source = "gamma"
+                    
+                    if outcome_prices and len(outcome_prices) >= 2:
+                        yes_price = float(outcome_prices[0])
+                        no_price = float(outcome_prices[1])
+                    else:
+                        # Gamma didn't provide prices - need CLOB REST fallback
+                        # This will be done at runtime by momentum_strategy
+                        yes_price = 0.0
+                        no_price = 0.0
+                        price_source = "clob_fallback"
+                    
+                    # Track price source and timestamp
+                    last_update_time = datetime.now(timezone.utc).isoformat()
                     
                     # Compute market status fields
                     accepting = result.get("accepting_orders")
@@ -171,6 +183,8 @@ class MarketDataService:
                         "no_token_id": no_token_id,
                         "yes_price": yes_price,
                         "no_price": no_price,
+                        "price_source": price_source,
+                        "last_update_time": last_update_time,
                         "title": result.get("question", ""),
                         "end_date": end_date,
                         "start_time": start_time,
@@ -201,16 +215,19 @@ class MarketDataService:
             print("[!] HARD FAIL: Cannot trade anything else. Exiting.")
             raise SystemExit(1)
         
-        # Print 5 examples
-        print("\nExample markets:")
-        for i, market in enumerate(self._hourly_markets[:5]):
+        # Print 3 examples with prices and source (startup proof)
+        print("\nStartup prices (first 3 markets):")
+        for i, market in enumerate(self._hourly_markets[:3]):
+            yes_p = market.get('yes_price', 0)
+            no_p = market.get('no_price', 0)
+            source = market.get('price_source', 'unknown')
+            last_update = market.get('last_update_time', '')[:19]
             print(f"  {i+1}. {market['title'][:50]}")
+            print(f"     YES: ${yes_p:.2f} | NO: ${no_p:.2f} | source={source}")
+            print(f"     Updated: {last_update}")
             print(f"     Start: {market['start_time'][:19]}")
             print(f"     End: {market['end_date'][:19]}")
             print(f"     Duration: {market['duration_min']:.0f} min")
-            hrs = market.get('hours_until', 0)
-            if hrs >= 0:
-                print(f"     Resolves in: {hrs:.1f} hours")
             print()
         
         print(f"{'='*60}\n")
@@ -353,3 +370,89 @@ class MarketDataService:
                 break
 
         return all_markets
+
+    def fetch_clob_price(self, token_id: str) -> float:
+        """Fetch current price from CLOB REST API.
+        Returns float price or None if failed."""
+        try:
+            # Try get_midpoint first
+            try:
+                price = self.client.get_midpoint(token_id)
+                if price is not None and price > 0:
+                    return float(price)
+            except:
+                pass
+            
+            # Try get_last_trade_price
+            try:
+                price = self.client.get_last_trade_price(token_id)
+                if price is not None and price > 0:
+                    return float(price)
+            except:
+                pass
+            
+            # Try get_price
+            try:
+                price = self.client.get_price(token_id, side="BUY")
+                if price is not None and price > 0:
+                    return float(price)
+            except:
+                pass
+                
+        except Exception as e:
+            pass  # Suppress errors - don't spam logs
+        
+        return None
+
+    def refresh_hourly_prices(self):
+        """Refresh prices for hourly markets using CLOB REST fallback.
+        Called periodically to get fresh prices."""
+        if not self._hourly_markets:
+            return
+        
+        now = datetime.now(timezone.utc)
+        updated_count = 0
+        no_price_count = 0
+        clob_errors = 0
+        
+        for market in self._hourly_markets:
+            yes_token = market.get("yes_token_id")
+            no_token = market.get("no_token_id")
+            
+            if not yes_token or not no_token:
+                continue
+            
+            # Check if we already have valid Gamma prices
+            existing_yes = market.get("yes_price", 0)
+            existing_no = market.get("no_price", 0)
+            existing_source = market.get("price_source", "unknown")
+            
+            # Only try CLOB if Gamma prices are missing/zero
+            if existing_yes <= 0 or existing_no <= 0:
+                # Fetch fresh prices from CLOB
+                yes_price = self.fetch_clob_price(yes_token)
+                no_price = self.fetch_clob_price(no_token)
+                
+                if yes_price is not None and no_price is not None:
+                    market["yes_price"] = yes_price
+                    market["no_price"] = no_price
+                    market["price_source"] = "clob_rest"
+                    market["last_update_time"] = now.isoformat()
+                    updated_count += 1
+                else:
+                    no_price_count += 1
+                    clob_errors += 1
+                    # Keep existing prices if available, mark as no_data only if both fail
+                    if existing_yes <= 0 and existing_no <= 0:
+                        market["price_source"] = "no_data"
+            else:
+                # Gamma prices are valid - keep them and update timestamp
+                market["last_update_time"] = now.isoformat()
+                if existing_source == "clob_fallback":
+                    market["price_source"] = "gamma"  # Now we have Gamma prices
+        
+        # Only print error summary once per cycle, not per token
+        if clob_errors > 0 and updated_count == 0:
+            print(f"[!] NO PRICE DATA - cannot trade (Gamma failed, CLOB failed)")
+        
+        return updated_count

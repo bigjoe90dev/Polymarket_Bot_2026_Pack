@@ -1,6 +1,7 @@
 {
   "_config_version": 17,
   "BOT_MODE": "BTC_1H_ONLY",
+  "BTC_1H_ONLY_PRICE_SOURCE": "auto",
   "USE_HOURLY_MARKETS": true,
   "MIN_PROFIT": 0.003,
   "COST_BUFFER": 0.002,

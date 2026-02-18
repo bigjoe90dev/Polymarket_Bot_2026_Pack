@@ -141,10 +141,14 @@ class TradingBot:
                 title = m.get("title", "")
                 # Get end_date from market metadata if available
                 end_date = m.get("end_date") or m.get("endDate") or m.get("end_date_iso")
+                # Get prices from Gamma API
+                yes_price = m.get("yes_price", 0.5)
+                no_price = m.get("no_price", 0.5)
                 
                 if yes_token and no_token:
                     was_registered = self.momentum_strategy.register_market(
-                        condition_id, yes_token, no_token, title, end_date=end_date
+                        condition_id, yes_token, no_token, title,
+                        end_date=end_date, yes_price=yes_price, no_price=no_price
                     )
                     if was_registered:
                         registered_count += 1
@@ -240,8 +244,28 @@ class TradingBot:
                 
                 # Heartbeat log every 60 seconds when not in window
                 if not in_window and (now - self._last_heartbeat_log >= 60):
-                    print(f"[*] 💤 Waiting: starts in {minutes_to_start} min - {first_market.get('title', '')[:50]}...")
+                    yes_p = first_market.get('yes_price', 0)
+                    no_p = first_market.get('no_price', 0)
+                    last_update = first_market.get('last_update_time', '')[:19]
+                    print(f"[*] 💤 Waiting: {first_market.get('title', '')[:40]}... YES:${yes_p:.2f} NO:${no_p:.2f} ({last_update})")
                     self._last_heartbeat_log = now
+                
+                # Live price update every 15 seconds
+                if not hasattr(self, '_last_price_update'):
+                    self._last_price_update = 0
+                if now - self._last_price_update >= 15:
+                    # Refresh prices from CLOB
+                    try:
+                        self.market.refresh_hourly_prices()
+                    except Exception as e:
+                        pass  # Suppress errors
+                    self._last_price_update = now
+                    
+                    # Print current market prices
+                    yes_p = first_market.get('yes_price', 0)
+                    no_p = first_market.get('no_price', 0)
+                    last_update = first_market.get('last_update_time', '')[:19]
+                    print(f"[*] 📊 Live: {first_market.get('title', '')[:40]}... YES:${yes_p:.2f} NO:${no_p:.2f} @ {last_update}")
             elif not markets and (now - self._last_heartbeat_log >= 60):
                 # No markets at all - heartbeat log
                 print(f"[*] 💤 Waiting: no active markets, retrying...")
