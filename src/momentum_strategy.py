@@ -271,6 +271,22 @@ class TrendTracker:
         
         return None, "none"
     
+    def is_entry_allowed(self, condition_id: str) -> tuple:
+        """Check if entry is allowed based on time remaining.
+        Returns (allowed: bool, minutes_left: float, cutoff: int)"""
+        cutoff = 10  # minutes
+        
+        metadata = self.market_metadata.get(condition_id, {})
+        end_date = metadata.get("end_date")
+        title = metadata.get("title", "")
+        
+        minutes_left, source = self.parse_time_left(title, end_date)
+        
+        if minutes_left is None:
+            return False, 0, cutoff
+        
+        return minutes_left > cutoff, minutes_left, cutoff
+    
     def compute_confidence(
         self,
         trendiness: float,
@@ -357,6 +373,15 @@ class TrendStrategy:
         self._last_poll_time = 0
         self._poll_interval = config.get("TREND_POLL_INTERVAL", 10) if config else 10
         
+        # Signal decision logging
+        self._last_signal_log_time = 0
+        
+        # Market watch logging (throttled)
+        self._last_watch_log_time = 0
+        
+        # WS health tracking - updated whenever WS sends price
+        self._last_ws_update_ts = 0
+        
         # Statistics
         self.signals_generated = 0
         self.trades_executed = 0
@@ -418,6 +443,7 @@ class TrendStrategy:
             "timeframe": timeframe or "1h",
             "yes_price": yes_price,
             "no_price": no_price,
+            "entry_allowed": True,  # Will be computed dynamically at trade time
         }
         
         # Register both YES and NO tokens
@@ -460,6 +486,10 @@ class TrendStrategy:
             buffer_len = len(self.tracker.price_buffers.get(token_id, []))
             print(f"[PRICE DEBUG] token={token_id[:20]}... price={price} buffer_len={buffer_len}")
             self._last_price_debug = now
+        
+        # CRITICAL: Track WS updates for health check
+        if source == "ws":
+            self._last_ws_update_ts = now
         
         self.tracker.update_price(token_id, price, source)
         self._process_signals(token_id)
@@ -514,13 +544,33 @@ class TrendStrategy:
         
         # Get market status for BTC_1H_ONLY mode
         market_status = None
+        now = time.time()
         if self.is_btc_1h_only and hasattr(market_service, '_hourly_markets'):
             hourly_markets = market_service._hourly_markets
             if hourly_markets:
-                # Get first active market
+                # CRITICAL: Prefer IN_WINDOW markets, then by hours_until
+                # First get all active markets
                 active = [m for m in hourly_markets if m.get('hours_until', -1) >= 0]
-                if active:
+                # Then prioritize in_window
+                in_window_markets = [m for m in active if m.get('in_window', False)]
+                if in_window_markets:
+                    # Use in_window market (already sorted by hours_until)
+                    m = in_window_markets[0]
+                    # Throttle log: only print every 30 seconds
+                    if now - self._last_watch_log_time > 30:
+                        print(f"[WATCH] Using IN_WINDOW market: {m.get('title', '')[:50]}... minutes_left={m.get('minutes_left')}")
+                        self._last_watch_log_time = now
+                elif active:
+                    # Fall back to upcoming market
                     m = active[0]
+                    # Throttle log: only print every 30 seconds
+                    if now - self._last_watch_log_time > 30:
+                        print(f"[WATCH] Using UPCOMING market: {m.get('title', '')[:50]}... minutes_to_start={m.get('minutes_to_start')}")
+                        self._last_watch_log_time = now
+                else:
+                    m = None
+                
+                if m:
                     market_status = {
                         'in_window': m.get('in_window', False),
                         'accepting_orders': m.get('accepting_orders', False),
@@ -539,6 +589,8 @@ class TrendStrategy:
             token_id: The token to process
             market_status: Optional dict with in_window, accepting_orders, minutes_left
         """
+        import time as time_module
+        
         with self._lock:
             market = self.token_to_market.get(token_id)
             if not market:
@@ -546,11 +598,13 @@ class TrendStrategy:
             
             # BTC_1H_ONLY: Check market window status first
             # Only evaluate when in_window=true AND accepting_orders=true AND minutes_left>=ENTRY_CUTOFF
+            is_in_window = False
             if self.is_btc_1h_only and market_status:
                 in_window = market_status.get('in_window', False)
                 accepting_orders = market_status.get('accepting_orders', False)
                 minutes_left = market_status.get('minutes_left')
                 entry_cutoff = self.config.get('TREND_TIME_LEFT_THRESHOLD', 5)  # Default 5 min
+                is_in_window = in_window and accepting_orders
                 
                 if not in_window:
                     # Market not in trading window - skip silently (reduce log spam)
@@ -563,6 +617,73 @@ class TrendStrategy:
                 if minutes_left is not None and minutes_left < entry_cutoff:
                     # Too close to expiry - skip
                     return
+            
+            # Get current price for SIGNAL log
+            current_price, price_time = self.tracker.last_prices.get(token_id, (None, None))
+            
+            # Get market info for SIGNAL log
+            market_title = market.get("market_name", "")
+            outcome = market.get("outcome", "")
+            condition_id = market.get("condition_id", "")
+            
+            # Compute signal metrics for logging (even if we skip)
+            trendiness = self.tracker.compute_trendiness(token_id)
+            return_5min = self.tracker.compute_return_5min(token_id)
+            rolling_high, rolling_low = self.tracker.get_rolling_high_low(token_id, minutes=10)
+            
+            # Get spread and liquidity if possible
+            spread_pct = "N/A"
+            liquidity = "N/A"
+            
+            # Get end_date for time left
+            end_date = None
+            if condition_id and condition_id in self.market_metadata:
+                end_date = self.market_metadata[condition_id].get("end_date")
+            time_left, time_source = self.tracker.parse_time_left(market_title, end_date)
+            
+            # Throttled SIGNAL log for in-window market (every 10 seconds)
+            now = time_module.time()
+            last_signal_log = getattr(self, '_last_signal_log_time', 0)
+            if is_in_window and (now - last_signal_log) >= 10:
+                self._last_signal_log_time = now
+                
+                # Determine decision and reason
+                decision = "HOLD"
+                reason = "unknown"
+                
+                # Check layers
+                is_sane, sanity_reason = self.tracker.is_data_sane(token_id)
+                if not is_sane:
+                    decision = "HOLD"
+                    reason = f"Layer0:{sanity_reason}"
+                elif trendiness < self.tracker.trendiness_threshold:
+                    decision = "HOLD"
+                    reason = f"Layer1:trend={trendiness:.2f}<{self.tracker.trendiness_threshold}"
+                elif rolling_high is None:
+                    decision = "HOLD"
+                    reason = "no_rolling_data"
+                elif outcome == "YES" and current_price and rolling_high and current_price > rolling_high:
+                    ticks_above = (current_price - rolling_high) * 100
+                    if ticks_above >= self.tracker.breakout_ticks:
+                        decision = "ENTER_LONG"
+                        reason = f"breakout_yes"
+                elif outcome == "NO" and current_price and rolling_low and current_price < rolling_low:
+                    ticks_below = (rolling_low - current_price) * 100
+                    if ticks_below >= self.tracker.breakout_ticks:
+                        decision = "ENTER_SHORT"
+                        reason = f"breakout_no"
+                else:
+                    # Check time left gate
+                    if time_left is not None and time_left < self.tracker.time_left_threshold:
+                        reason = f"time_left:{time_left:.1f}min"
+                    else:
+                        reason = f"no_breakout"
+                
+                # Format the log
+                token_short = token_id[:12] + "..." if len(token_id) > 12 else token_id
+                print(f"[SIGNAL] market={market_title[:30]}... token={token_short} mid={current_price:.4f if current_price else 0:.4f} "
+                      f"lookback=600s move={return_5min*100:.2f}% trend={trendiness:.2f} spread={spread_pct} liquidity={liquidity} "
+                      f"decision={decision} reason={reason}")
             
             # Layer 0: Data sanity check
             is_sane, sanity_reason = self.tracker.is_data_sane(token_id)
@@ -765,6 +886,8 @@ class TrendStrategy:
         )
         
         # Execute paper trade through paper_engine (so it shows on dashboard)
+        print(f"[EXEC] attempting entry market={condition_id[:20]}... token={token_id[:20]}... side={outcome} size={self.config.get('MOMENTUM_SIZE', 5.0)}")
+        
         if self.paper_engine:
             try:
                 # Build signal dict in the format execute_copy_trade expects
@@ -780,13 +903,22 @@ class TrendStrategy:
                     "usdc_value": self.config.get("MOMENTUM_SIZE", 5.0),
                 }
                 
+                # Entry cutoff check: only allow entries when > 10 minutes left
+                entry_allowed, mins_left, cutoff = self.is_entry_allowed(condition_id)
+                if not entry_allowed:
+                    print(f"[*] Entry blocked: minutes_left={mins_left:.0f} cutoff={cutoff} - {market_name[:40]}...")
+                    return None  # Skip this signal
+                
                 # Execute through paper engine
                 result = self.paper_engine.execute_copy_trade(
                     signal,
                     current_exposure=0.0
                 )
                 
-                if result and result.get("success"):
+                if not result or not result.get("success"):
+                    reason = result.get("reason", "unknown") if result else "null_result"
+                    print(f"[EXEC] blocked reason={reason} market={condition_id[:20]}...")
+                elif result and result.get("success"):
                     self.tracker.record_trade(token_id)
                     self.trades_executed += 1
                     

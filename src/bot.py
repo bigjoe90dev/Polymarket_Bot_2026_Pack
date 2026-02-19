@@ -105,6 +105,7 @@ class TradingBot:
                 self.clob_websocket = None
         
         if self.is_btc_1h_only:
+            print("[*] MODE: BTC_1H_ONLY - disabled whale/copy/blockchain/arb/parity")
             print("[*] Momentum strategy initialized (BTC_1H_ONLY mode)")
         else:
             print("[*] Momentum strategy initialized (1H trend-following, WS + REST fallback)")
@@ -176,8 +177,18 @@ class TradingBot:
         if self.is_btc_1h_only:
             # Start CLOB WebSocket for real-time prices (momentum needs sub-second updates!)
             if self.clob_websocket:
-                print(f"[*] DEBUG: Passing {len(markets)} markets to WebSocket, first market cid: {markets[0].get('condition_id', 'NONE') if markets else 'EMPTY'}")
-                self.clob_websocket.update_market_cache(markets)
+                # CRITICAL: Only pass the SELECTED market (first in_window, else first upcoming)
+                # This limits subscriptions to 2 assets (YES + NO tokens)
+                if markets:
+                    selected = markets[0]  # Already sorted by in_window priority
+                    selected_market = [selected]  # Wrap in list for update_market_cache
+                    yes_token = selected.get('yes_token_id', '')
+                    no_token = selected.get('no_token_id', '')
+                    print(f"[*] SELECTED MARKET: {selected.get('title', '')[:50]}...")
+                    print(f"[*] Subscribing to YES={yes_token[:20]}... NO={no_token[:20]}...")
+                    self.clob_websocket.update_market_cache(selected_market)
+                else:
+                    self.clob_websocket.update_market_cache(markets)
                 self.clob_websocket.start()
                 print(f"[*] CLOB WebSocket started for REAL-TIME prices (momentum strategy)")
             else:
@@ -259,7 +270,10 @@ class TradingBot:
                 if in_window and not self._was_in_window:
                     print(f"[*] 🚀 ENTERING WINDOW: {first_market.get('title', '')[:60]}")
                     print(f"[*] Status: IN_WINDOW - {minutes_left} min left")
-                    print(f"[*] Entry allowed: YES" if minutes_left and minutes_left >= 5 else f"[*] Entry allowed: NO (cutoff)")
+                    cutoff = 10
+                    entry_allowed = minutes_left is not None and minutes_left > cutoff
+                    reason = "" if entry_allowed else " (last 10 mins blocked)"
+                    print(f"[*] Entry rule: minutes_left={minutes_left} cutoff={cutoff} -> entry_allowed={entry_allowed}{reason}")
                 
                 # Update window state
                 self._was_in_window = in_window
@@ -338,9 +352,48 @@ class TradingBot:
                         self._ws_healthy = False
                         print("[*] WS unhealthy for 60s, using REST polling fallback")
                 
-                # Always use REST polling as fallback (runs every cycle)
-                # This ensures price buffers are updated even if WS is having issues
-                self.momentum_strategy.poll_prices(self.market, source="rest")
+                # FIXED: Only poll REST when WS is stale (>10 seconds since last price update)
+                # But don't report stale until WS has connected and received at least one update
+                ws_stale_threshold = 10  # seconds
+                
+                # Use the dedicated WS timestamp (updated whenever WS sends price)
+                last_ws = getattr(self.momentum_strategy, '_last_ws_update_ts', 0)
+                
+                # Only check staleness if we've received at least one WS update (last_ws > 0)
+                if last_ws > 0:
+                    ws_is_stale = (now - last_ws) > ws_stale_threshold
+                else:
+                    # First WS update not yet received - don't declare stale yet
+                    ws_is_stale = False
+                
+                # Also log token-level debug for troubleshooting
+                if not ws_is_stale:
+                    # Count only the currently subscribed assets (should be 2 for selected market)
+                    # Get from the selected market's tokens
+                    token_count = 0
+                    if markets:
+                        selected = markets[0]
+                        if selected.get('yes_token_id') and selected.get('no_token_id'):
+                            token_count = 2  # YES + NO for selected market
+                    
+                    # Get most recent token update time
+                    most_recent = 0
+                    for _, ts in self.momentum_strategy.tracker.last_prices.values():
+                        if ts > most_recent:
+                            most_recent = ts
+                    print(f"[DATA] WS healthy ({token_count} assets, last update {now - most_recent:.1f}s ago)")
+                
+                if ws_is_stale:
+                    # Log first time we switch to REST
+                    if not getattr(self, '_rest_poll_logged', False):
+                        print(f"[DATA] WS stale (>10s no updates), polling REST fallback")
+                        self._rest_poll_logged = True
+                    self.momentum_strategy.poll_prices(self.market, source="rest")
+                else:
+                    # WS is healthy - skip REST polling
+                    if not getattr(self, '_ws_healthy_logged', False):
+                        print("[DATA] WS healthy, skipping REST")
+                        self._ws_healthy_logged = True
                 
                 # Check exit conditions for open positions
                 self.momentum_strategy.check_exits()

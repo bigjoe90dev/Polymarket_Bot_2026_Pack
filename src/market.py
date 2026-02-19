@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import BookParams
@@ -32,6 +33,9 @@ class MarketDataService:
         # For 1H discovery
         self._hourly_markets = []
         self._hourly_discovered = False
+        
+        # For throttling FIRST_MARKET log
+        self._last_first_market_log = 0
     
     def _discover_hourly_markets(self):
         """Dynamically discover 1H BTC Up/Down markets from Gamma API using slug generation."""
@@ -55,8 +59,12 @@ class MarketDataService:
                 slugs.append(slug)
             
             # PM markets: 12pm, 1pm, 2pm, ... 11pm
+            # CRITICAL: Polymarket uses 12pm, 1pm, 2pm... NOT 13pm, 14pm...
+            # 12pm stays as 12, but 13->1, 14->2, ... 23->11
             for hour in range(12, 24):
-                slug = f'bitcoin-up-or-down-{month_name}-{day.day}-{hour}pm-et'
+                # Convert 24h to 12h format
+                hour_12 = hour if hour == 12 else hour - 12
+                slug = f'bitcoin-up-or-down-{month_name}-{day.day}-{hour_12}pm-et'
                 slugs.append(slug)
         
         print(f"[*] Testing {len(slugs)} candidate slugs...")
@@ -70,10 +78,27 @@ class MarketDataService:
                 if resp.status_code == 200:
                     data = resp.json()
                     if data and isinstance(data, list) and len(data) > 0:
+                        # Log matched slug
+                        print(f"[SLUG] Found: {slug}")
                         return data[0]
             except:
                 pass
             return None
+        
+        # AUDIT: Track counts at each filter stage
+        audit = {
+            'total_responses': 0,
+            'active_check': 0,
+            'accepting_orders': 0,
+            'closed_archived': 0,
+            'btc_check': 0,
+            'updown_check': 0,
+            'times_present': 0,
+            'duration_check': 0,
+            'expired': 0,
+            'token_ids': 0,
+            'valid': 0,
+        }
         
         # Use ThreadPoolExecutor for speed
         import concurrent.futures
@@ -81,24 +106,30 @@ class MarketDataService:
             futures = {executor.submit(fetch_slug, slug): slug for slug in slugs}
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
+                audit['total_responses'] += 1
                 if not result:
                     continue
                 
                 # Check if market is active
                 if not result.get("active", False):
+                    audit['active_check'] += 1
                     continue
                 # accepting_orders can be None or True - treat None as True (open for trading)
                 accepting = result.get("accepting_orders")
                 if accepting is False:  # Only skip if explicitly False
+                    audit['accepting_orders'] += 1
                     continue
                 if result.get("closed", False) or result.get("archived", False):
+                    audit['closed_archived'] += 1
                     continue
                 
                 # Check question
                 question = result.get("question", "").lower()
                 if "bitcoin" not in question and "btc" not in question:
+                    audit['btc_check'] += 1
                     continue
                 if "up or down" not in question and "up/down" not in question:
+                    audit['updown_check'] += 1
                     continue
                 
                 # Get times - eventStartTime is the actual 1H window start
@@ -107,6 +138,7 @@ class MarketDataService:
                 end_date = result.get('endDate', '')
                 
                 if not start_time or not end_date:
+                    audit['times_present'] += 1
                     continue
                 
                 # Parse duration
@@ -126,6 +158,7 @@ class MarketDataService:
                     
                     # Must be ~60 minutes (1 hour)
                     if not (50 <= duration_min <= 70):
+                        audit['duration_check'] += 1
                         continue
                     
                     # Check if resolves within reasonable time (not past, not too far)
@@ -134,6 +167,7 @@ class MarketDataService:
                     
                     # Skip markets that have already resolved (expired)
                     if hours_until < 0:
+                        audit['expired'] += 1
                         continue
                     
                     # Get token info from Gamma response
@@ -141,6 +175,7 @@ class MarketDataService:
                     token_ids = json.loads(result.get('clobTokenIds', '[]'))
                     
                     if len(token_ids) != 2:
+                        audit['token_ids'] += 1
                         continue
                     
                     yes_token_id = token_ids[0]
@@ -183,6 +218,22 @@ class MarketDataService:
                             # Market hasn't started yet
                             minutes_to_start = int((start_dt - now).total_seconds() / 60)
                     
+                    # DEBUG: Print time check for all candidates (we'll sort and print closest later)
+                    # Store debug info for later sorting/printing
+                    debug_info = {
+                        'title': result.get('question', '')[:50],
+                        'start': start_dt.isoformat() if start_dt else None,
+                        'end': end_dt.isoformat() if end_dt else None,
+                        'now': now.isoformat(),
+                        'in_window': in_window,
+                        'minutes_to_start': minutes_to_start,
+                        'minutes_left': minutes_left,
+                        'duration_min': duration_min,
+                    }
+                    if not hasattr(self, '_debug_market_times'):
+                        self._debug_market_times = []
+                    self._debug_market_times.append(debug_info)
+                    
                     valid_markets.append({
                         "condition_id": result.get("condition_id"),
                         "yes_token_id": yes_token_id,
@@ -200,16 +251,47 @@ class MarketDataService:
                         "in_window": in_window,
                         "minutes_left": minutes_left,
                         "minutes_to_start": minutes_to_start,
+                        # Entry cutoff: only allow entries when > 10 minutes left
+                        "entry_allowed": minutes_left is not None and minutes_left > 10,
                     })
+                    audit['valid'] += 1
                     
                 except Exception as e:
                     continue
         
-        # Sort by hours until resolution
-        valid_markets.sort(key=lambda x: x.get('hours_until', 999))
+        # CRITICAL: Sort to prioritize IN_WINDOW markets first, then by hours_until
+        # in_window=True comes first (False < True in Python sort)
+        valid_markets.sort(key=lambda x: (not x.get('in_window', False), x.get('hours_until', 999)))
         
         self._hourly_markets = valid_markets
         self._hourly_discovered = True
+        
+        # AUDIT: Print filter stage counts
+        print(f"\n[AUDIT] Filter stages:")
+        print(f"  Total responses from Gamma: {audit['total_responses']}")
+        print(f"  Rejected: active=False: {audit['active_check']}")
+        print(f"  Rejected: accepting_orders=False: {audit['accepting_orders']}")
+        print(f"  Rejected: closed/archived: {audit['closed_archived']}")
+        print(f"  Rejected: not BTC: {audit['btc_check']}")
+        print(f"  Rejected: not Up/Down: {audit['updown_check']}")
+        print(f"  Rejected: no times: {audit['times_present']}")
+        print(f"  Rejected: duration != 60min: {audit['duration_check']}")
+        print(f"  Rejected: already expired: {audit['expired']}")
+        print(f"  Rejected: !=2 tokens: {audit['token_ids']}")
+        print(f"  VALID markets: {audit['valid']}")
+        
+        # Print TIMECHK for CLOSEST markets (sorted by start time)
+        if hasattr(self, '_debug_market_times') and self._debug_market_times:
+            # Sort by start time to show closest markets first
+            self._debug_market_times.sort(key=lambda x: x['start'] or 'z')
+            now_iso = datetime.now(timezone.utc).isoformat()
+            print(f"\n[TIMECHK] now_utc={now_iso}")
+            print("Closest markets by start time:")
+            for i, dbg in enumerate(self._debug_market_times[:10]):
+                print(f"  {i+1}. {dbg['title'][:50]}")
+                print(f"     start={dbg['start']} end={dbg['end']}")
+                print(f"     in_window={dbg['in_window']} minutes_to_start={dbg['minutes_to_start']} minutes_left={dbg['minutes_left']}")
+            self._debug_market_times = []  # Clear for next refresh
         
         # Print summary
         print(f"\n{'='*60}")
@@ -228,12 +310,19 @@ class MarketDataService:
             no_p = market.get('no_price', 0)
             source = market.get('price_source', 'unknown')
             last_update = market.get('last_update_time', '')[:19]
+            in_win = market.get('in_window', False)
+            status = ">>> IN_WINDOW <<<" if in_win else "UPCOMING"
             print(f"  {i+1}. {market['title'][:50]}")
+            print(f"     Status: {status}")
             print(f"     YES: ${yes_p:.2f} | NO: ${no_p:.2f} | source={source}")
             print(f"     Updated: {last_update}")
             print(f"     Start: {market['start_time'][:19]}")
             print(f"     End: {market['end_date'][:19]}")
             print(f"     Duration: {market['duration_min']:.0f} min")
+            if market.get('minutes_left'):
+                print(f"     Minutes left: {market['minutes_left']}")
+            elif market.get('minutes_to_start'):
+                print(f"     Minutes to start: {market['minutes_to_start']}")
             print()
         
         print(f"{'='*60}\n")
@@ -251,7 +340,10 @@ class MarketDataService:
             if in_window:
                 print(f"[*] WATCHING: {first_market['title'][:60]}")
                 print(f"[*] Status: IN_WINDOW - {minutes_left} min left")
-                print(f"[*] Entry allowed: YES" if minutes_left and minutes_left >= 5 else f"[*] Entry allowed: NO (cutoff)")
+                cutoff = 10
+                entry_allowed = minutes_left is not None and minutes_left > cutoff
+                reason = "" if entry_allowed else " (last 10 mins blocked)"
+                print(f"[*] Entry rule: minutes_left={minutes_left} cutoff={cutoff} -> entry_allowed={entry_allowed}{reason}")
             else:
                 print(f"[*] NEXT MARKET: {first_market['title'][:60]}")
                 print(f"[*] Status: UPCOMING - starts in {minutes_to_start} min")
@@ -335,7 +427,42 @@ class MarketDataService:
             if self._hourly_markets:
                 # Filter out resolved markets - only return active ones
                 active_markets = [m for m in self._hourly_markets if m.get('hours_until', -1) >= 0]
-                return active_markets
+                
+                # A) NEVER select markets with minutes_left <= 0 or None (cutoff/expired)
+                tradable = [m for m in active_markets
+                           if m.get('minutes_left') is not None and m.get('minutes_left') > 0]
+                
+                # If no tradable in_window markets, fall back to upcoming
+                if not tradable:
+                    # Get upcoming markets (minutes_to_start > 0)
+                    upcoming = [m for m in active_markets
+                               if m.get('minutes_to_start') is not None and m.get('minutes_to_start') > 0]
+                    if upcoming:
+                        # Sort by minutes_to_start (soonest first)
+                        upcoming.sort(key=lambda x: x.get('minutes_to_start', 999))
+                        tradable = upcoming
+                
+                # Re-sort to ensure in_window comes first (defensive, in case of stale data)
+                tradable.sort(key=lambda x: (not x.get('in_window', False), x.get('hours_until', 999)))
+                
+                # Log which market is first (for debugging, throttled)
+                if tradable:
+                    first = tradable[0]
+                    in_win = first.get('in_window', False)
+                    mins_left = first.get('minutes_left')
+                    mins_to_start = first.get('minutes_to_start')
+                    # Entry cutoff: only allow entries when > 10 minutes left
+                    entry_allowed = mins_left is not None and mins_left > 10
+                    cutoff_minutes = 10
+                    # Throttle: only print every 30 seconds
+                    now = time.time()
+                    if now - self._last_first_market_log > 30:
+                        reason = "" if entry_allowed else " (last 10 mins blocked)"
+                        print(f"[*] Entry rule: minutes_left={mins_left} cutoff={cutoff_minutes} -> entry_allowed={entry_allowed}{reason}")
+                        print(f"[*] FIRST MARKET: {first['title'][:50]}... in_window={in_win} minutes_to_start={mins_to_start}")
+                        self._last_first_market_log = now
+                
+                return tradable
             else:
                 # If no hourly markets found, hard fail
                 print("[!] No hourly markets available - HARD FAIL")

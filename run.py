@@ -1,5 +1,6 @@
 import time
 import sys
+import traceback
 from src.config import load_or_create_config
 from src.bot import TradingBot
 
@@ -29,6 +30,7 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"\n[!] Critical Error: {e}")
+        print(traceback.format_exc())
         bot.shutdown()
         sys.exit(1)
 

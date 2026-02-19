@@ -193,9 +193,11 @@ def main():
         result = discover_markets(asset, args.days)
         results[asset] = result
         
+        one_hour = result['one_hour']
+        four_hour = result['four_hour']
         print(f'\n{asset} Results:')
-        print(f'  1H markets: {len(result[\"one_hour\"])}')
-        print(f'  4H markets: {len(result[\"four_hour\"])}')
+        print(f'  1H markets: {len(one_hour)}')
+        print(f'  4H markets: {len(four_hour)}')
     
     # Save to JSON
     output_path = 'data/discovered_real_markets.json'

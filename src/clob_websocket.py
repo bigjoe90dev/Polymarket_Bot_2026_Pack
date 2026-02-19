@@ -517,44 +517,98 @@ class CLOBWebSocketMonitor:
         Polymarket format: bids/asks are arrays of objects with price/size,
         not arrays of tuples like [[price, size], ...]
         Example: {"bids": [{"price": "0.55", "size": "100"}, ...], ...}
+        
+        FIXED: Use asset_id as primary key, derive mid-price, call callback.
         """
-        market = data.get("market", "") or data.get("asset_id", "")
+        # CRITICAL: Use asset_id (token_id) as primary key, NOT market
+        token_id = data.get("asset_id", "")
+        if not token_id:
+            token_id = data.get("market", "")
+        
+        if not token_id:
+            return
+            
         bids = data.get("bids", [])
         asks = data.get("asks", [])
         
-        # FIXED: Parse as objects, not tuples
-        # Polymarket sends: [{"price": "0.55", "size": "100"}, ...]
+        # Parse as objects - Polymarket sends: [{"price": "0.55", "size": "100"}, ...]
+        # Use None for missing sides (not 0.0)
+        best_bid = None
+        best_ask = None
+        
         for lvl in bids:
             if isinstance(lvl, dict):
                 price = float(lvl.get("price", 0))
                 size = float(lvl.get("size", 0))
                 if price and size:
-                    self.order_book.update_bid(market, price, size)
+                    self.order_book.update_bid(token_id, price, size)
+                    if best_bid is None or price > best_bid:
+                        best_bid = price
             elif isinstance(lvl, list):
-                # Legacy tuple format [[price, size], ...]
                 price, size = lvl
-                self.order_book.update_bid(market, float(price), float(size))
+                try:
+                    price = float(price)
+                    size = float(size)
+                except (ValueError, TypeError):
+                    continue
+                if price and size:
+                    self.order_book.update_bid(token_id, price, size)
+                    if best_bid is None or price > best_bid:
+                        best_bid = price
         
         for lvl in asks:
             if isinstance(lvl, dict):
-                price = float(lvl.get("price", 0))
-                size = float(lvl.get("size", 0))
+                try:
+                    price = float(lvl.get("price", 0))
+                    size = float(lvl.get("size", 0))
+                except (ValueError, TypeError):
+                    continue
                 if price and size:
-                    self.order_book.update_ask(market, price, size)
+                    self.order_book.update_ask(token_id, price, size)
+                    if best_ask is None or price < best_ask:
+                        best_ask = price
             elif isinstance(lvl, list):
                 price, size = lvl
-                self.order_book.update_ask(market, float(price), float(size))
+                try:
+                    price = float(price)
+                    size = float(size)
+                except (ValueError, TypeError):
+                    continue
+                if price and size:
+                    self.order_book.update_ask(token_id, price, size)
+                    if best_ask is None or price < best_ask:
+                        best_ask = price
         
-        self._last_book_update[market] = time.time()
+        self._last_book_update[token_id] = time.time()
         
-        # Only log first 5 snapshots to reduce spam, then only log periodically
-        snapshot_count = getattr(self, '_snapshot_log_count', 0)
-        if snapshot_count < 5:
-            print(f"[CLOB] Book snapshot: {market[:20]}... bids={len(bids)}, asks={len(asks)}")
-            self._snapshot_log_count = snapshot_count + 1
-        elif snapshot_count == 5:
-            print(f"[CLOB] ... (suppressing further snapshot logs for cleanliness)")
-            self._snapshot_log_count = snapshot_count + 1
+        # DERIVE MID-PRICE: Only if both best_bid and best_ask exist
+        mid_price = None
+        if best_bid is not None and best_ask is not None:
+            mid_price = (best_bid + best_ask) / 2
+            # Sanity check: price should be between 0.01 and 0.99
+            if 0.01 <= mid_price <= 0.99:
+                # Call momentum callback with derived mid-price
+                if self.price_callback:
+                    try:
+                        self.price_callback(token_id, mid_price)
+                    except Exception:
+                        pass  # Silent fail for callback
+            else:
+                # Price out of range, skip
+                mid_price = None
+        
+        # Controlled debug logging (once per 5 seconds per token max)
+        now = time.time()
+        last_debug = getattr(self, '_last_snapshot_debug', {})
+        last_ts = last_debug.get(token_id, 0)
+        if now - last_ts >= 5:
+            self._last_snapshot_debug = last_debug
+            self._last_snapshot_debug[token_id] = now
+            # Show None for missing sides
+            bid_str = f"{best_bid:.4f}" if best_bid is not None else "None"
+            ask_str = f"{best_ask:.4f}" if best_ask is not None else "None"
+            mid_str = f"{mid_price:.4f}" if mid_price is not None else "None"
+            print(f"[PRICE DEBUG] token={token_id[:20]}... mid={mid_str} best_bid={bid_str} best_ask={ask_str}")
 
     async def _handle_price_change(self, data: Dict):
         """Handle price_change event.
@@ -573,17 +627,40 @@ class CLOBWebSocketMonitor:
         
         for change in price_changes:
             asset_id = change.get("asset_id", "")
-            price = float(change.get("price", 0))
-            size = float(change.get("size", 0))
+            
+            # Use None for missing values (not 0)
+            try:
+                price_val = change.get("price")
+                price = float(price_val) if price_val not in (None, "", 0) else None
+            except (ValueError, TypeError):
+                price = None
+            
+            try:
+                size_val = change.get("size")
+                size = float(size_val) if size_val not in (None, "", 0) else 0
+            except (ValueError, TypeError):
+                size = 0
+            
             side = change.get("side", "")
-            best_bid = float(change.get("best_bid", 0))
-            best_ask = float(change.get("best_ask", 0))
+            
+            # Use None for missing best_bid/best_ask
+            try:
+                bid_val = change.get("best_bid")
+                best_bid = float(bid_val) if bid_val not in (None, "", 0) else None
+            except (ValueError, TypeError):
+                best_bid = None
+            
+            try:
+                ask_val = change.get("best_ask")
+                best_ask = float(ask_val) if ask_val not in (None, "", 0) else None
+            except (ValueError, TypeError):
+                best_ask = None
             
             if not asset_id:
                 continue
             
             # FALLBACK: If no price in message, try best_bid/best_ask mid
-            if not price and best_bid > 0 and best_ask > 0:
+            if price is None and best_bid is not None and best_ask is not None:
                 price = (best_bid + best_ask) / 2
                 # Also print diagnostic for this case
                 if hasattr(self, '_mid_price_fallback_count'):
@@ -593,13 +670,13 @@ class CLOBWebSocketMonitor:
                 if self._mid_price_fallback_count <= 3:
                     print(f"[CLOB FALLBACK] Using mid price: best_bid={best_bid}, best_ask={best_ask} -> price={price}")
             
-            if not price:
+            if price is None:
                 continue
             
-            # Update order book with best bid/ask
-            if best_bid > 0:
+            # Update order book with best bid/ask (only if not None)
+            if best_bid is not None:
                 self.order_book.update_bid(asset_id, best_bid, size if side == "BUY" else 0)
-            if best_ask > 0:
+            if best_ask is not None:
                 self.order_book.update_ask(asset_id, best_ask, size if side == "SELL" else 0)
             
             # Also update at the traded price
