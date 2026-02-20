@@ -274,7 +274,8 @@ class TrendTracker:
     def is_entry_allowed(self, condition_id: str) -> tuple:
         """Check if entry is allowed based on time remaining.
         Returns (allowed: bool, minutes_left: float, cutoff: int)"""
-        cutoff = 10  # minutes
+        # Use config value for cutoff, default to 10 minutes
+        cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
         
         metadata = self.market_metadata.get(condition_id, {})
         end_date = metadata.get("end_date")
@@ -885,8 +886,8 @@ class TrendStrategy:
             time_left_source=time_left_source
         )
         
-        # Execute paper trade through paper_engine (so it shows on dashboard)
-        print(f"[EXEC] attempting entry market={condition_id[:20]}... token={token_id[:20]}... side={outcome} size={self.config.get('MOMENTUM_SIZE', 5.0)}")
+        # SIGNAL CHAIN: [SIGNAL] -> [RISK] -> [EXEC] -> [PAPER]
+        print(f"[SIGNAL] -> {action} confidence={confidence:.2f} price={price:.4f} market={condition_id[:16]}...")
         
         if self.paper_engine:
             try:
@@ -903,13 +904,15 @@ class TrendStrategy:
                     "usdc_value": self.config.get("MOMENTUM_SIZE", 5.0),
                 }
                 
-                # Entry cutoff check: only allow entries when > 10 minutes left
+                # RISK: Entry cutoff check - verify we can still enter
                 entry_allowed, mins_left, cutoff = self.is_entry_allowed(condition_id)
                 if not entry_allowed:
-                    print(f"[*] Entry blocked: minutes_left={mins_left:.0f} cutoff={cutoff} - {market_name[:40]}...")
+                    print(f"[RISK] BLOCKED entry_allowed=False minutes_left={mins_left:.0f} cutoff={cutoff}")
                     return None  # Skip this signal
+                print(f"[RISK] OK entry_allowed=True minutes_left={mins_left:.0f} cutoff={cutoff}")
                 
-                # Execute through paper engine
+                # EXEC: Submit to paper engine
+                print(f"[EXEC] submitting trade to paper_engine...")
                 result = self.paper_engine.execute_copy_trade(
                     signal,
                     current_exposure=0.0
@@ -917,7 +920,7 @@ class TrendStrategy:
                 
                 if not result or not result.get("success"):
                     reason = result.get("reason", "unknown") if result else "null_result"
-                    print(f"[EXEC] blocked reason={reason} market={condition_id[:20]}...")
+                    print(f"[EXEC] BLOCKED reason={reason} market={condition_id[:20]}...")
                 elif result and result.get("success"):
                     self.tracker.record_trade(token_id)
                     self.trades_executed += 1
@@ -933,6 +936,9 @@ class TrendStrategy:
                         market_name=market_name
                     )
                     self.tracker.positions[condition_id] = position
+                    
+                    # PAPER: Confirm trade recorded
+                    print(f"[PAPER] SUCCESS trade_id={result.get('trade_id', 'N/A')} market={condition_id[:16]}...")
                     
                     # None-safe formatting
                     price_str = f"${price:.2f}" if price is not None else "$0.00"

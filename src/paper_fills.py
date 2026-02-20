@@ -1,7 +1,7 @@
 """Order book fill simulation for paper trading."""
 
 
-def simulate_fill(order_book_side, size):
+def simulate_fill(order_book_side, size, slippage_multiplier=1.0):
     """
     Walk the order book to simulate a fill.
 
@@ -9,6 +9,7 @@ def simulate_fill(order_book_side, size):
         order_book_side: [[price, size], ...] sorted ascending for asks,
                          descending for bids.
         size: number of shares to fill.
+        slippage_multiplier: multiplier for slippage (for paper safety).
 
     Returns dict with fill details.
     """
@@ -53,7 +54,9 @@ def simulate_fill(order_book_side, size):
         }
 
     vwap = total_cost / filled_size
-    slippage = abs(vwap - best_price)
+    raw_slippage = abs(vwap - best_price)
+    # Apply multiplier for paper safety simulation
+    slippage = raw_slippage * slippage_multiplier
 
     return {
         "filled": remaining <= 0,
@@ -65,7 +68,7 @@ def simulate_fill(order_book_side, size):
     }
 
 
-def simulate_two_leg_fill(asks_yes, asks_no, size, yes_fee_bps=0, no_fee_bps=0):
+def simulate_two_leg_fill(asks_yes, asks_no, size, yes_fee_bps=0, no_fee_bps=0, slippage_multiplier=1.0):
     """
     Simulate filling both legs of a locked-profit trade.
 
@@ -73,8 +76,8 @@ def simulate_two_leg_fill(asks_yes, asks_no, size, yes_fee_bps=0, no_fee_bps=0):
     """
     from src.paper_fees import calculate_trading_fee
 
-    yes_fill = simulate_fill(asks_yes, size)
-    no_fill = simulate_fill(asks_no, size)
+    yes_fill = simulate_fill(asks_yes, size, slippage_multiplier)
+    no_fill = simulate_fill(asks_no, size, slippage_multiplier)
 
     both_filled = yes_fill["filled"] and no_fill["filled"]
 

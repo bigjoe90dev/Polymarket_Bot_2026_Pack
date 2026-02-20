@@ -1,5 +1,6 @@
 import time
 import threading
+from datetime import datetime, timezone
 from src.market import MarketDataService
 from src.strategy import check_opportunity
 from src.execution import ExecutionEngine
@@ -141,6 +142,61 @@ class TradingBot:
 
     def run(self):
         print("[*] Bot warming up...")
+        
+        # A3: Prove persistence + file paths at startup
+        import os
+        data_dir = "data"
+        os.makedirs(data_dir, exist_ok=True)
+        
+        paper_state_path = os.path.join(data_dir, "paper_state.json")
+        paper_trades_path = os.path.join(data_dir, "paper_trades.jsonl")
+        snapshots_dir = os.path.join(data_dir, "snapshots")
+        os.makedirs(snapshots_dir, exist_ok=True)
+        
+        print(f"[FILE] paper_state path: {paper_state_path}")
+        print(f"[FILE] paper_trades path: {paper_trades_path}")
+        print(f"[FILE] snapshots dir: {snapshots_dir}")
+        
+        # Verify paper engine writable
+        if hasattr(self, 'execution') and hasattr(self.execution, 'paper_engine') and self.execution.paper_engine:
+            pe = self.execution.paper_engine
+            print(f"[FILE] paper_engine initialized: cash_balance=${pe.portfolio.get('cash_balance', 0):.2f}")
+            
+            # Verify paper_trades.jsonl is writable
+            try:
+                trades_path = os.path.join(data_dir, "paper_trades.jsonl")
+                # Test write access
+                with open(trades_path, "a") as f:
+                    pass
+                print(f"[FILE] paper_trades.jsonl: writable")
+            except Exception as e:
+                print(f"[FILE] WARNING: paper_trades.jsonl not writable: {e}")
+        
+        # Log paper safety multiplier
+        safety_mult = self.config.get("PAPER_SAFETY_MULTIPLIER", 1.0)
+        if safety_mult > 1.0:
+            print(f"[PAPER] Safety multiplier: {safety_mult}x (fees/slippage/spread assumptions inflated)")
+        
+        # Tracking for SELECT AUDIT throttling (A4)
+        self._last_audit_market_id = None
+        self._last_audit_entry_allowed = None
+        self._last_audit_is_live = None
+        
+        # A4: Tracking for DECISION trace throttling (shows strategy evaluation)
+        self._last_decision_log_time = 0
+        self._last_decision_market = None
+        self._last_decision_signal = None
+        
+        # Activity watchdog for forced trades
+        force_mode = self.config.get("PAPER_FORCE_MODE", "OFF")
+        if force_mode != "OFF":
+            print(f"[FORCE] {force_mode} mode enabled - will force trades if no signals")
+        self._force_mode = force_mode
+        self._last_trade_time = 0
+        self._force_trade_after_seconds = self.config.get("PAPER_FORCE_TRADE_AFTER_MINUTES", 5) * 60
+        self._force_trade_size = self.config.get("PAPER_FORCE_TRADE_SIZE_USD", 5.0)
+        self._force_max_spread = self.config.get("PAPER_FORCE_TRADE_MAX_SPREAD", 0.03)
+        
         markets = self.market.get_active_markets()
         self._current_markets = markets
         self._last_market_refresh = time.time()
@@ -187,6 +243,10 @@ class TradingBot:
                     print(f"[*] SELECTED MARKET: {selected.get('title', '')[:50]}...")
                     print(f"[*] Subscribing to YES={yes_token[:20]}... NO={no_token[:20]}...")
                     self.clob_websocket.update_market_cache(selected_market)
+                    # Initialize tracking for first selected market
+                    self._current_condition_id = selected.get('condition_id', '')
+                    self._current_yes_token = yes_token
+                    self._current_no_token = no_token
                 else:
                     self.clob_websocket.update_market_cache(markets)
                 self.clob_websocket.start()
@@ -222,9 +282,39 @@ class TradingBot:
         if not markets:
             print("[!] No active markets found - HARD FAIL")
             raise SystemExit(1)
+        
+        # A5: One-shot self-check at startup
+        if self.is_btc_1h_only:
+            print("\n[STARTUP CHECK]")
+            # Check prices flowing
+            if hasattr(self, 'clob_websocket') and self.clob_websocket:
+                ws_age = 0
+                if hasattr(self.clob_websocket, '_last_message_time'):
+                    ws_age = time.time() - getattr(self.clob_websocket, '_last_message_time', 0)
+                print(f"  prices_flowing: last_ws_update_age={ws_age:.1f}s")
+            
+            # Check strategy ready
+            if hasattr(self, 'momentum_strategy'):
+                ms = self.momentum_strategy
+                has_history = hasattr(ms.tracker, 'price_buffers') and len(ms.tracker.price_buffers) > 0
+                warmup = "N/A"
+                print(f"  strategy_ready: has_price_history={has_history}, warmup_remaining={warmup}")
+            
+            # Check execution ready
+            pe_ready = hasattr(self, 'execution') and hasattr(self.execution, 'paper_engine') and self.execution.paper_engine
+            print(f"  execution_ready: paper_engine={pe_ready}")
+            print()
 
         # Track previous window state for transition detection
         self._was_in_window = False
+        
+        # Track current selected market for rollover detection
+        self._current_condition_id = None
+        self._current_yes_token = None
+        self._current_no_token = None
+        
+        # Config values for rollover
+        self._rollover_buffer_seconds = self.config.get("ROLLOVER_BUFFER_SECONDS", 20)
         
         # Heartbeat tracker
         self._last_heartbeat_log = 0
@@ -252,6 +342,25 @@ class TradingBot:
                         self._market_offset = 0
                         self._last_market_refresh = now
                         print(f"[*] Market refresh: {len(markets)} active markets")
+                        
+                        # AUDIT: Log selection status after refresh
+                        if self.is_btc_1h_only and markets:
+                            in_window_count = sum(1 for m in markets if m.get('in_window', False))
+                            cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
+                            in_window_eligible = sum(1 for m in markets
+                                if m.get('in_window', False) and
+                                m.get('accepting_orders', True) and
+                                m.get('minutes_left', 0) is not None and
+                                m.get('minutes_left', 0) > cutoff)
+                            print(f"\n[AUDIT] Selection status:")
+                            print(f"  total_valid={len(markets)}, in_window={in_window_count}, in_window_eligible={in_window_eligible}")
+                            first = markets[0]
+                            if first.get('in_window'):
+                                print(f"  SELECTED: in_window, minutes_left={first.get('minutes_left')}, cutoff={cutoff}")
+                            else:
+                                print(f"  SELECTED: upcoming, minutes_to_start={first.get('minutes_to_start')}")
+                            print()
+                        
                         # v14: Update blockchain monitor market cache
                         if self.blockchain_monitor:
                             self.blockchain_monitor.update_market_cache(markets)
@@ -260,20 +369,76 @@ class TradingBot:
 
             # ── BTC_1H_ONLY: Check market window and log transitions ──
             if self.is_btc_1h_only and markets:
-                # Get the first market (next to trade)
+                # Get the first market (selected by market.py priority)
                 first_market = markets[0]
                 in_window = first_market.get('in_window', False)
-                minutes_left = first_market.get('minutes_left', 0)
-                minutes_to_start = first_market.get('minutes_to_start', 0)
+                minutes_left = first_market.get('minutes_left')
+                minutes_to_start = first_market.get('minutes_to_start')
+                current_condition_id = first_market.get('condition_id', '')
+                current_yes_token = first_market.get('yes_token_id', '')
+                current_no_token = first_market.get('no_token_id', '')
+                entry_allowed = first_market.get('entry_allowed', False)
+                entry_reason = first_market.get('entry_reason', 'unknown')
+                cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
+                
+                # A4: Throttle SELECT AUDIT - only print when state changes
+                now_utc = datetime.now(timezone.utc).isoformat()
+                start_iso = first_market.get('start_time', '')[:19]
+                end_iso = first_market.get('end_date', '')[:19]
+                
+                # Check if anything changed
+                market_changed = (current_condition_id != self._last_audit_market_id)
+                entry_changed = (entry_allowed != self._last_audit_entry_allowed)
+                live_changed = (in_window != self._last_audit_is_live)
+                
+                if market_changed or entry_changed or live_changed:
+                    print(f"\n[SELECT AUDIT]")
+                    print(f"  now_utc={now_utc}")
+                    print(f"  selected={first_market.get('title', '')[:50]}...")
+                    print(f"  is_live={in_window}")
+                    print(f"  accepting_orders={first_market.get('accepting_orders', True)}")
+                    print(f"  start={start_iso} end={end_iso}")
+                    print(f"  minutes_to_start={minutes_to_start} minutes_left={minutes_left}")
+                    print(f"  cutoff={cutoff}")
+                    print(f"  entry_allowed={entry_allowed} with reason: {entry_reason}")
+                    print()
+                    
+                    # Update tracking
+                    self._last_audit_market_id = current_condition_id
+                    self._last_audit_entry_allowed = entry_allowed
+                    self._last_audit_is_live = in_window
+                
+                # ── ROLLOVER DETECTION: Check if market changed or expired ──
+                # Rollover triggers: condition_id changed OR market ended (minutes_left <= 0)
+                market_ended = minutes_left is not None and minutes_left <= 0
+                market_changed = current_condition_id != self._current_condition_id
+                
+                if market_changed or market_ended:
+                    old_title = self._current_condition_id[:30] if self._current_condition_id else "None"
+                    new_title = first_market.get('title', current_condition_id)[:50]
+                    reason = "market_changed" if market_changed else "market_ended"
+                    print(f"[ROLLOVER] {reason}: {old_title} -> {new_title}")
+                    
+                    # Update tracking
+                    self._current_condition_id = current_condition_id
+                    self._current_yes_token = current_yes_token
+                    self._current_no_token = current_no_token
+                    
+                    # Resubscribe to new market
+                    if self.clob_websocket and self.clob_websocket.running:
+                        selected_market = [first_market]
+                        self.clob_websocket.update_market_cache(selected_market)
+                        # Clear and resubscribe
+                        self.clob_websocket._market_condition_ids = {current_condition_id}
+                        self.clob_websocket._yes_token_id = current_yes_token
+                        self.clob_websocket._no_token_id = current_no_token
+                        print(f"[ROLLOVER] Resubscribed to new market: YES={current_yes_token[:20]}... NO={current_no_token[:20]}...")
                 
                 # Check for UPCOMING -> IN_WINDOW transition
                 if in_window and not self._was_in_window:
                     print(f"[*] 🚀 ENTERING WINDOW: {first_market.get('title', '')[:60]}")
                     print(f"[*] Status: IN_WINDOW - {minutes_left} min left")
-                    cutoff = 10
-                    entry_allowed = minutes_left is not None and minutes_left > cutoff
-                    reason = "" if entry_allowed else " (last 10 mins blocked)"
-                    print(f"[*] Entry rule: minutes_left={minutes_left} cutoff={cutoff} -> entry_allowed={entry_allowed}{reason}")
+                    print(f"[*] Entry rule: minutes_left={minutes_left} cutoff={cutoff} -> entry_allowed={entry_allowed} ({entry_reason})")
                 
                 # Update window state
                 self._was_in_window = in_window
@@ -310,7 +475,8 @@ class TradingBot:
             # ── Dynamic risk limits: scale with account balance ──
             if self.execution.paper_engine:
                 pe = self.execution.paper_engine
-                self.risk.update_limits(pe.portfolio["cash_balance"], pe.starting_balance)
+                cash = pe.portfolio.get("cash_balance", pe.starting_balance)
+                self.risk.update_limits(cash, pe.starting_balance)
 
             # ── BTC_1H_ONLY mode: Skip all whale tracking ─────
             if not self.is_btc_1h_only:
@@ -334,6 +500,97 @@ class TradingBot:
                 blockchain_signals = []
                 clob_signals = []
                 polled_signals = []
+
+            # A4: DECISION trace - deterministic chain when evaluating momentum strategy
+            if self.is_btc_1h_only and markets and now - self._last_decision_log_time >= self.config.get("MOMENTUM_DECISION_LOG_INTERVAL", 30):
+                # Get current selected market info
+                first_market = markets[0]
+                current_condition_id = first_market.get('condition_id', '')
+                
+                # Get price status
+                yes_token = first_market.get('yes_token_id', '')
+                no_token = first_market.get('no_token_id', '')
+                yes_price = first_market.get('yes_price', 0)
+                no_price = first_market.get('no_price', 0)
+                
+                # Get strategy evaluation status
+                strategy_status = "UNKNOWN"
+                last_signal = "NONE"
+                if hasattr(self, 'momentum_strategy'):
+                    ms = self.momentum_strategy
+                    # Check if prices are flowing
+                    yes_ts = ms.tracker.last_prices.get(yes_token, (None, None))[1]
+                    no_ts = ms.tracker.last_prices.get(no_token, (None, None))[1]
+                    price_age = max(
+                        now - yes_ts if yes_ts else 999,
+                        now - no_ts if no_ts else 999
+                    )
+                    
+                    # Get latest decision from log
+                    if ms.tracker.decisions_log:
+                        last_decision = ms.tracker.decisions_log[-1]
+                        last_signal = f"{last_decision.action}:{last_decision.reason[:20]}"
+                    
+                    strategy_status = f"price_age={price_age:.1f}s"
+                
+                # Check if market is tradable
+                minutes_left = first_market.get('minutes_left')
+                in_window = minutes_left is not None and minutes_left > self.config.get("NO_TRADE_LAST_MINUTES", 10)
+                accepting = first_market.get('accepting_orders', False)
+                entry_allowed = in_window and accepting
+                
+                # Only log when something significant changes or on interval
+                market_changed = (current_condition_id != self._last_decision_market)
+                signal_changed = (last_signal != self._last_decision_signal)
+                
+                if market_changed or signal_changed or (now - self._last_decision_log_time) >= 60:
+                    print(f"\n[DECISION]")
+                    print(f"  market={first_market.get('title', '')[:40]}...")
+                    print(f"  in_window={in_window} accepting={accepting} entry_allowed={entry_allowed}")
+                    print(f"  prices: YES={yes_price:.4f} NO={no_price:.4f}")
+                    print(f"  strategy: {strategy_status}")
+                    print(f"  last_signal: {last_signal}")
+                    print(f"  force_mode: {self._force_mode}")
+                    print()
+                    
+                    self._last_decision_market = current_condition_id
+                    self._last_decision_signal = last_signal
+                self._last_decision_log_time = now
+            
+            # Activity watchdog: Force trade if no trades for too long
+            if self.is_btc_1h_only and self._force_mode != "OFF" and self.execution.paper_engine:
+                time_since_trade = now - self._last_trade_time
+                if time_since_trade > self._force_trade_after_seconds:
+                    print(f"[FORCE] No trades for {time_since_trade/60:.1f} min - attempting forced entry")
+                    # Force a trade with current market conditions
+                    if markets:
+                        selected = markets[0]
+                        # Check spread is acceptable
+                        yes_p = selected.get('yes_price', 0.5)
+                        no_p = selected.get('no_price', 0.5)
+                        spread = abs(yes_p + no_p - 1.0)
+                        if spread <= self._force_max_spread:
+                            # Force entry in random direction
+                            import random
+                            side = random.choice(["YES", "NO"])
+                            token_id = selected.get('yes_token_id') if side == "YES" else selected.get('no_token_id')
+                            # Execute through momentum strategy's paper engine
+                            if hasattr(self, 'momentum_strategy') and self.momentum_strategy.paper_engine:
+                                self.momentum_strategy._execute_entry(
+                                    token_id=token_id,
+                                    price=yes_p if side == "YES" else no_p,
+                                    market={
+                                        "condition_id": selected.get('condition_id'),
+                                        "outcome": side,
+                                        "market_name": selected.get('title', ''),
+                                    },
+                                    action=f"ENTER_{side}",
+                                    confidence=0.8
+                                )
+                                self._last_trade_time = now
+                                print(f"[FORCE] Forced entry: {side} @ {yes_p if side == 'YES' else no_p}")
+                        else:
+                            print(f"[FORCE] Skipped - spread {spread:.4f} > max {self._force_max_spread}")
 
             # ── Momentum Strategy: WS-first + REST fallback ─────
             # Check WebSocket health and switch to REST polling if needed
@@ -630,7 +887,7 @@ class TradingBot:
 
         # Flush all state files to prevent data loss
         try:
-            if self.execution.paper_engine:
+            if self.execution and hasattr(self.execution, 'paper_engine') and self.execution.paper_engine:
                 self.execution.paper_engine._save_state()
                 print("[*] Paper state saved.")
         except Exception as e:

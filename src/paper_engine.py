@@ -15,6 +15,7 @@ from src.records import log_decision
 from src.stress_sim import StressSimulator
 
 STATE_FILE = "data/paper_state.json"
+TRADES_FILE = "data/paper_trades.jsonl"
 SNAPSHOT_INTERVAL = 60  # seconds between PnL snapshots
 MAX_TRADE_HISTORY = 1000
 MAX_SNAPSHOTS = 10000
@@ -34,20 +35,40 @@ class PaperTradingEngine:
         self.notifier = None  # Set by bot.py after construction
         self.starting_balance = config.get("PAPER_BALANCE", 1000.0)
         self._last_snapshot_time = 0
+        self._last_save_time = 0  # For throttling _save_state calls
         self._hedge_blocks = 0  # Counter for anti-hedge blocks
         self.stress = StressSimulator()  # Comprehensive friction simulation
         self._load_or_create_state()
+    
+    @property
+    def portfolio(self):
+        """Compatibility shim - returns portfolio dict or default if not initialized."""
+        if not hasattr(self, '_portfolio') or not self._portfolio:
+            # Return default portfolio
+            return {
+                "cash_balance": self.starting_balance,
+                "positions": {},
+                "total_trades": 0,
+                "starting_balance": self.starting_balance,
+            }
+        return self._portfolio
+    
+    @portfolio.setter
+    def portfolio(self, value):
+        """Set portfolio via the internal attribute."""
+        self._portfolio = value
 
     # ── State Persistence ────────────────────────────────────────
 
     def _load_or_create_state(self):
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-
+        os.makedirs("data", exist_ok=True)
+        
         if os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, "r") as f:
                     state = json.load(f)
-                self.portfolio = state
+                self._portfolio = state
                 print(f"[PAPER] Loaded state: balance=${state['cash_balance']:.2f}, "
                       f"{len(state.get('positions', {}))} positions, "
                       f"{state.get('total_trades', 0)} trades")
@@ -55,7 +76,7 @@ class PaperTradingEngine:
             except Exception as e:
                 print(f"[!] Error loading paper state, creating fresh: {e}")
 
-        self.portfolio = {
+        self._portfolio = {
             "version": 3,
             "starting_balance": self.starting_balance,
             "cash_balance": self.starting_balance,
@@ -74,14 +95,43 @@ class PaperTradingEngine:
         }
         self._save_state()
         print(f"[PAPER] New portfolio: starting balance=${self.starting_balance:.2f}")
+    
+    def _log_paper_trade(self, trade_data):
+        """Append a paper trade to the JSONL file."""
+        try:
+            # Check if this is the first write (file doesn't exist yet)
+            is_first_write = not os.path.exists(TRADES_FILE)
+            with open(TRADES_FILE, "a") as f:
+                f.write(json.dumps(trade_data) + "\n")
+            if is_first_write:
+                print(f"[PAPER] Trade log append ok: {TRADES_FILE}")
+        except Exception as e:
+            print(f"[!] Failed to log paper trade: {e}")
 
-    def _save_state(self):
-        self.portfolio["last_updated"] = time.time()
+    # Minimum interval between saves (seconds)
+    SAVE_INTERVAL = 10
+    
+    def _save_state(self, force=False):
+        # Defensive: ensure portfolio exists before saving
+        if not hasattr(self, '_portfolio') or not self._portfolio:
+            print("[PAPER] State save skipped: reason=no_portfolio")
+            return
+        
+        # Throttle saves to once per SAVE_INTERVAL unless forced
+        now = time.time()
+        if not force and hasattr(self, '_last_save_time') and (now - self._last_save_time) < self.SAVE_INTERVAL:
+            return
+        
+        self._last_save_time = now
+        self._portfolio["last_updated"] = now
         try:
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(self.portfolio, f, indent=2)
+                json.dump(self._portfolio, f, indent=2)
             os.replace(tmp, STATE_FILE)
+            print(f"[PAPER] State saved: balance=${self._portfolio.get('cash_balance', 0):.2f}, "
+                  f"positions={len(self._portfolio.get('positions', {}))}, "
+                  f"trades={self._portfolio.get('total_trades', 0)}")
         except Exception as e:
             print(f"[!] Error saving paper state: {e}")
 
@@ -154,6 +204,7 @@ class PaperTradingEngine:
             # Look up fee rates
             yes_fee_bps = self._get_fee_rate(yes_token)
             no_fee_bps = self._get_fee_rate(no_token)
+            slippage_multiplier = self.config.get("PAPER_SAFETY_MULTIPLIER", 1.0)
 
             # Simulate fills against live order book
             result = simulate_two_leg_fill(
@@ -162,6 +213,7 @@ class PaperTradingEngine:
                 size,
                 yes_fee_bps,
                 no_fee_bps,
+                slippage_multiplier,
             )
 
             if not result["both_filled"]:
@@ -565,6 +617,24 @@ class PaperTradingEngine:
                          f"slip={slip_pct:.1f}% gas=${gas_fee:.3f}"
                          f"{tags_str} on \"{market_title}\"")
 
+            # Log to paper_trades.jsonl
+            balance_after = self.portfolio["cash_balance"]
+            self._log_paper_trade({
+                "timestamp": time.time(),
+                "market_title": market_title,
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "side": outcome,
+                "price": our_price,
+                "size": shares,
+                "fees": fee,
+                "slippage": slip_pct,
+                "balance_after": balance_after,
+            })
+            
+            # Print clear proof line
+            print(f"[PAPER TRADE] BUY {outcome} price={our_price:.4f} size={shares:.2f} fees=${fee:.4f} slippage={slip_pct:.2f}% balance=${balance_after:.2f}")
+
             return {
                 "success": True,
                 "total_cost": round(total_cost, 4),
@@ -700,16 +770,19 @@ class PaperTradingEngine:
         """Get fee rate in bps for a token. Returns conservative default on failure.
 
         v14 ENHANCEMENT: Now uses market classification fallback for accuracy.
+        Applies PAPER_SAFETY_MULTIPLIER to fees for conservative simulation.
         """
+        multiplier = self.config.get("PAPER_SAFETY_MULTIPLIER", 1.0)
+        
         if not self.market_client or not token_id:
-            return DEFAULT_FEE_BPS  # Conservative fallback
+            return DEFAULT_FEE_BPS * multiplier  # Conservative fallback
         try:
             # v14: Pass market_title and condition_id for classification fallback
             rate = self.market_client.get_fee_rate_bps(token_id, market_title, condition_id)
-            return rate
+            return rate * multiplier  # Apply safety multiplier
         except Exception as e:
             log_decision("FEE_WARN", f"Fee lookup failed for {token_id[:12] if token_id else '?'}: {e}")
-            return DEFAULT_FEE_BPS  # Conservative fallback
+            return DEFAULT_FEE_BPS * multiplier  # Conservative fallback
 
     # ── Auto Sell (Take-Profit / Stop-Loss) ─────────────────────
 

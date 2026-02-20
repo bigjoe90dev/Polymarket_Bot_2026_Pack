@@ -259,9 +259,97 @@ class MarketDataService:
                 except Exception as e:
                     continue
         
-        # CRITICAL: Sort to prioritize IN_WINDOW markets first, then by hours_until
-        # in_window=True comes first (False < True in Python sort)
-        valid_markets.sort(key=lambda x: (not x.get('in_window', False), x.get('hours_until', 999)))
+        # CRITICAL: Selection priority - ALWAYS prefer LIVE markets
+        # Priority A: LIVE markets (any) - attach/monitor for rollover
+        # Priority B: UPCOMING markets - only if no LIVE markets exist
+        cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
+        
+        # AUDIT: Track selection reasons
+        audit_select = {
+            'total_valid': len(valid_markets),
+            'live_count': 0,           # is_live = start <= now < end
+            'live_accepting': 0,       # live + accepting_orders
+            'live_blocked_cutoff': 0,  # live but minutes_left <= cutoff
+            'live_blocked_not_accepting': 0,  # live but not accepting_orders
+            'upcoming_count': 0,
+            'selected': None,
+            'selected_reason': '',
+        }
+        
+        # Separate into LIVE (in_window) and UPCOMING
+        live_markets = []       # in_window = True (any state)
+        upcoming_markets = []   # in_window = False (not started yet)
+        
+        for m in valid_markets:
+            mins_left = m.get('minutes_left', 0)
+            mins_to_start = m.get('minutes_to_start', 0)
+            accepting = m.get('accepting_orders', True)
+            
+            if m.get('in_window', False):  # LIVE market
+                audit_select['live_count'] += 1
+                
+                if not accepting:
+                    audit_select['live_blocked_not_accepting'] += 1
+                    print(f"[SELECT] LIVE but blocked (not accepting): {m.get('title', '')[:40]}...")
+                elif mins_left is not None and mins_left <= cutoff:
+                    audit_select['live_blocked_cutoff'] += 1
+                    print(f"[SELECT] LIVE but blocked (cutoff): minutes_left={mins_left:.0f} <= {cutoff}: {m.get('title', '')[:40]}...")
+                else:
+                    audit_select['live_accepting'] += 1
+                
+                # ALWAYS add to live_markets (for monitoring/rollover)
+                live_markets.append(m)
+            else:  # UPCOMING market
+                audit_select['upcoming_count'] += 1
+                upcoming_markets.append(m)
+        
+        # SELECTION LOGIC:
+        # Priority A: LIVE markets - pick one with smallest minutes_left (closest to settlement)
+        if live_markets:
+            live_markets.sort(key=lambda x: x.get('minutes_left', 999))
+            selected = live_markets[0]
+            
+            # Determine entry_allowed
+            mins_left = selected.get('minutes_left', 0)
+            accepting = selected.get('accepting_orders', True)
+            
+            if not accepting:
+                entry_reason = "blocked_not_accepting"
+            elif mins_left is not None and mins_left <= cutoff:
+                entry_reason = "blocked_cutoff"
+            else:
+                entry_reason = "allowed_live"
+            
+            audit_select['selected'] = selected
+            audit_select['selected_reason'] = f"LIVE, minutes_left={mins_left}, entry={entry_reason}"
+            
+            # Set entry_allowed on the market
+            selected['entry_allowed'] = (entry_reason == "allowed_live")
+            selected['entry_reason'] = entry_reason
+            
+            print(f"[SELECT] Selected LIVE market: {selected.get('title', '')[:50]}")
+            print(f"[SELECT]   minutes_left={mins_left}, cutoff={cutoff}, accepting={accepting}")
+            print(f"[SELECT]   entry_allowed={selected['entry_allowed']} ({entry_reason})")
+        # Priority B: UPCOMING - only if no LIVE markets
+        elif upcoming_markets:
+            upcoming_markets.sort(key=lambda x: x.get('minutes_to_start', 999))
+            selected = upcoming_markets[0]
+            
+            audit_select['selected'] = selected
+            audit_select['selected_reason'] = f"upcoming_wait, minutes_to_start={selected.get('minutes_to_start')}"
+            
+            # Set entry_allowed = False for upcoming
+            selected['entry_allowed'] = False
+            selected['entry_reason'] = "upcoming_wait"
+            
+            print(f"[SELECT] No LIVE markets; selecting UPCOMING: {selected.get('title', '')[:50]}")
+            print(f"[SELECT]   minutes_to_start={selected.get('minutes_to_start')}, entry_allowed=False (upcoming)")
+        else:
+            selected = None
+        
+        # Combine: LIVE first, then UPCOMING
+        valid_markets = live_markets + upcoming_markets
+        valid_markets.sort(key=lambda x: x.get('hours_until', 999))
         
         self._hourly_markets = valid_markets
         self._hourly_discovered = True
