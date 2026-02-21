@@ -84,6 +84,15 @@ class TradingBot:
         self._ws_healthy = False
         self._ws_last_healthy_time = 0
         
+        # WS liveness + reconnect tracking (Phase C)
+        self._ws_stale_seconds = config.get("WS_STALE_SECONDS", 20)
+        self._ws_rest_fallback_seconds = config.get("WS_REST_FALLBACK_SECONDS", 5)
+        self._ws_reconnect_backoff_max = config.get("WS_RECONNECT_BACKOFF_MAX", 30)
+        self._ws_last_reconnect_time = 0
+        self._ws_reconnect_attempt = 0
+        self._ws_is_stale = False
+        self._ws_last_stale_log = 0
+        
         # Always create momentum strategy for BTC_1H_ONLY mode
         self.momentum_strategy = MomentumStrategy(
             paper_engine=self.execution.paper_engine,
@@ -303,6 +312,38 @@ class TradingBot:
             # Check execution ready
             pe_ready = hasattr(self, 'execution') and hasattr(self.execution, 'paper_engine') and self.execution.paper_engine
             print(f"  execution_ready: paper_engine={pe_ready}")
+            
+            # E1: Add one-line startup summary with all config values
+            print("\n[CONFIG SUMMARY]")
+            ws_stale = self.config.get("WS_STALE_SECONDS", 20)
+            ws_fallback = self.config.get("WS_REST_FALLBACK_SECONDS", 5)
+            backoff_max = self.config.get("WS_RECONNECT_BACKOFF_MAX", 30)
+            decision_interval = self.config.get("MOMENTUM_DECISION_LOG_INTERVAL", 30)
+            force_mode = self.config.get("PAPER_FORCE_MODE", "OFF")
+            cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
+            min_points = self.config.get("TREND_MIN_HISTORY_POINTS", 20)
+            min_seconds = self.config.get("TREND_MIN_HISTORY_SECONDS", 10)
+            print(f"  WS_STALE_SECONDS={ws_stale} WS_REST_FALLBACK_SECONDS={ws_fallback} WS_RECONNECT_BACKOFF_MAX={backoff_max}")
+            print(f"  MOMENTUM_DECISION_LOG_INTERVAL={decision_interval} PAPER_FORCE_MODE={force_mode} NO_TRADE_CUTOFF={cutoff}")
+            print(f"  TREND_MIN_HISTORY_POINTS={min_points} TREND_MIN_HISTORY_SECONDS={min_seconds}")
+            
+            # B: Verify token subscription at startup
+            if markets:
+                selected = markets[0]
+                yes_token = selected.get('yes_token_id', '')
+                no_token = selected.get('no_token_id', '')
+                print(f"\n[TOKEN SUB]")
+                print(f"  Market: {selected.get('title', '')[:50]}...")
+                print(f"  YES token: {yes_token[:20]}...")
+                print(f"  NO token: {no_token[:20]}...")
+                
+                # Verify momentum strategy registered these tokens
+                if hasattr(self, 'momentum_strategy'):
+                    ms = self.momentum_strategy
+                    yes_registered = yes_token in ms.token_to_market
+                    no_registered = no_token in ms.token_to_market
+                    print(f"  YES in strategy: {yes_registered}")
+                    print(f"  NO in strategy: {no_registered}")
             print()
 
         # Track previous window state for transition detection
@@ -516,6 +557,10 @@ class TradingBot:
                 # Get strategy evaluation status
                 strategy_status = "UNKNOWN"
                 last_signal = "NONE"
+                price_age = 999
+                ws_status = "UNKNOWN"
+                no_trade_reason = "N/A"
+                
                 if hasattr(self, 'momentum_strategy'):
                     ms = self.momentum_strategy
                     # Check if prices are flowing
@@ -531,6 +576,27 @@ class TradingBot:
                         last_decision = ms.tracker.decisions_log[-1]
                         last_signal = f"{last_decision.action}:{last_decision.reason[:20]}"
                     
+                    # C1: Determine why no trade - explicit reasons
+                    # Check history status for YES token
+                    yes_history = ms.tracker.get_history_status(yes_token)
+                    no_history = ms.tracker.get_history_status(no_token)
+                    
+                    if self._ws_is_stale:
+                        no_trade_reason = "ws_stale"
+                    elif price_age > 60:
+                        no_trade_reason = "no_price_updates"
+                    elif not yes_history.get("sane", False):
+                        no_trade_reason = "insufficient_history"
+                    elif last_signal.startswith("HOLD"):
+                        # Extract the actual HOLD reason
+                        if "trend=" in last_signal:
+                            no_trade_reason = "threshold_not_met"
+                        else:
+                            no_trade_reason = last_signal.split(":", 1)[1] if ":" in last_signal else "unknown"
+                    elif not entry_allowed:
+                        no_trade_reason = "blocked_cutoff"
+                    
+                    ws_status = "STALE" if self._ws_is_stale else "HEALTHY"
                     strategy_status = f"price_age={price_age:.1f}s"
                 
                 # Check if market is tradable
@@ -547,10 +613,23 @@ class TradingBot:
                     print(f"\n[DECISION]")
                     print(f"  market={first_market.get('title', '')[:40]}...")
                     print(f"  in_window={in_window} accepting={accepting} entry_allowed={entry_allowed}")
+                    print(f"  minutes_left={minutes_left}")
                     print(f"  prices: YES={yes_price:.4f} NO={no_price:.4f}")
-                    print(f"  strategy: {strategy_status}")
+                    print(f"  ws_status: {ws_status} (price_age={price_age:.1f}s)")
                     print(f"  last_signal: {last_signal}")
+                    print(f"  no_trade_because: {no_trade_reason}")
                     print(f"  force_mode: {self._force_mode}")
+                    
+                    # A: History diagnostics
+                    print(f"\n[HISTORY]")
+                    # YES token
+                    yes_sane = yes_history.get("sane", False)
+                    yes_status = "OK" if yes_sane else "FAIL"
+                    print(f"  YES {yes_history.get('token_id', 'N/A')} points={yes_history.get('points', 0)} span={yes_history.get('span_seconds', 0):.1f}s last_age={yes_history.get('last_age', 999):.1f}s (req >={yes_history.get('min_points', 20)}/>={yes_history.get('min_seconds', 10)}s) {yes_status}")
+                    # NO token
+                    no_sane = no_history.get("sane", False)
+                    no_status = "OK" if no_sane else "FAIL"
+                    print(f"  NO  {no_history.get('token_id', 'N/A')} points={no_history.get('points', 0)} span={no_history.get('span_seconds', 0):.1f}s last_age={no_history.get('last_age', 999):.1f}s (req >={no_history.get('min_points', 20)}/>={no_history.get('min_seconds', 10)}s) {no_status}")
                     print()
                     
                     self._last_decision_market = current_condition_id
@@ -609,47 +688,82 @@ class TradingBot:
                         self._ws_healthy = False
                         print("[*] WS unhealthy for 60s, using REST polling fallback")
                 
-                # FIXED: Only poll REST when WS is stale (>10 seconds since last price update)
-                # But don't report stale until WS has connected and received at least one update
-                ws_stale_threshold = 10  # seconds
+                # A2: Use config WS_STALE_SECONDS instead of hardcoded value
+                ws_stale_threshold = self._ws_stale_seconds  # From config (default 20s)
                 
                 # Use the dedicated WS timestamp (updated whenever WS sends price)
                 last_ws = getattr(self.momentum_strategy, '_last_ws_update_ts', 0)
+                last_ws_update_age = now - last_ws if last_ws > 0 else 999
                 
-                # Only check staleness if we've received at least one WS update (last_ws > 0)
+                # Check staleness - only if we've received at least one WS update
                 if last_ws > 0:
-                    ws_is_stale = (now - last_ws) > ws_stale_threshold
+                    self._ws_is_stale = last_ws_update_age > ws_stale_threshold
                 else:
                     # First WS update not yet received - don't declare stale yet
-                    ws_is_stale = False
+                    self._ws_is_stale = False
                 
-                # Also log token-level debug for troubleshooting
-                if not ws_is_stale:
-                    # Count only the currently subscribed assets (should be 2 for selected market)
-                    # Get from the selected market's tokens
-                    token_count = 0
-                    if markets:
-                        selected = markets[0]
-                        if selected.get('yes_token_id') and selected.get('no_token_id'):
-                            token_count = 2  # YES + NO for selected market
+                # A3: Automatic reconnect with backoff when stale
+                if self._ws_is_stale:
+                    # Log stale detection (throttled to avoid spam)
+                    if now - self._ws_last_stale_log >= 30:
+                        print(f"[WS] STALE age={last_ws_update_age:.0f}s > {ws_stale_threshold}s -> reconnecting")
+                        self._ws_last_stale_log = now
                     
-                    # Get most recent token update time
-                    most_recent = 0
-                    for _, ts in self.momentum_strategy.tracker.last_prices.values():
-                        if ts > most_recent:
-                            most_recent = ts
-                    print(f"[DATA] WS healthy ({token_count} assets, last update {now - most_recent:.1f}s ago)")
+                    # Check if we should attempt reconnect (with backoff)
+                    reconnect_delay = min(self._ws_reconnect_backoff_max, 2 ** self._ws_reconnect_attempt)
+                    if now - self._ws_last_reconnect_time >= reconnect_delay:
+                        print(f"[WS] Attempting reconnect (attempt {self._ws_reconnect_attempt + 1}, delay={reconnect_delay}s)...")
+                        self._ws_last_reconnect_time = now
+                        self._ws_reconnect_attempt += 1
+                        
+                        # Perform reconnect
+                        if self.clob_websocket and hasattr(self.clob_websocket, 'stop'):
+                            try:
+                                # Stop existing connection
+                                self.clob_websocket.stop()
+                            except:
+                                pass
+                        
+                        # Recreate and restart
+                        if self.is_btc_1h_only and self.config.get("USE_CLOB_WEBSOCKET", True):
+                            # Recreate websocket monitor
+                            from src.clob_websocket import CLOBWebSocketMonitor
+                            self.clob_websocket = CLOBWebSocketMonitor(self.config, None)
+                            
+                            # Get current tokens
+                            if markets:
+                                selected = markets[0]
+                                yes_token = selected.get('yes_token_id', '')
+                                no_token = selected.get('no_token_id', '')
+                                
+                                # Setup callback
+                                def on_price_update(token_id, price):
+                                    if self.momentum_strategy:
+                                        self.momentum_strategy.on_price_update(token_id, price, source="ws")
+                                self.clob_websocket.price_callback = on_price_update
+                                
+                                # Update market cache and subscribe
+                                self.clob_websocket.update_market_cache([selected])
+                                self.clob_websocket._market_condition_ids = {selected.get('condition_id', '')}
+                                self.clob_websocket._yes_token_id = yes_token
+                                self.clob_websocket._no_token_id = no_token
+                                
+                                try:
+                                    self.clob_websocket.start()
+                                    print(f"[WS] Reconnected + resubscribed YES={yes_token[:12]}... NO={no_token[:12]}...")
+                                    # Reset reconnect attempt counter on success
+                                    self._ws_reconnect_attempt = 0
+                                except Exception as e:
+                                    print(f"[WS] Reconnect failed: {e}")
                 
-                if ws_is_stale:
-                    # Log first time we switch to REST
-                    if not getattr(self, '_rest_poll_logged', False):
-                        print(f"[DATA] WS stale (>10s no updates), polling REST fallback")
-                        self._rest_poll_logged = True
+                # B1: Always use REST fallback when WS is stale
+                if self._ws_is_stale:
+                    # Poll REST for prices to keep momentum strategy building history
                     self.momentum_strategy.poll_prices(self.market, source="rest")
                 else:
-                    # WS is healthy - skip REST polling
+                    # WS is healthy - only log occasionally to confirm liveness
                     if not getattr(self, '_ws_healthy_logged', False):
-                        print("[DATA] WS healthy, skipping REST")
+                        print(f"[DATA] WS healthy (last update {last_ws_update_age:.1f}s ago)")
                         self._ws_healthy_logged = True
                 
                 # Check exit conditions for open positions

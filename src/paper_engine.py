@@ -99,12 +99,21 @@ class PaperTradingEngine:
     def _log_paper_trade(self, trade_data):
         """Append a paper trade to the JSONL file."""
         try:
+            # Ensure data directory exists
+            trades_dir = os.path.dirname(TRADES_FILE)
+            if trades_dir:
+                os.makedirs(trades_dir, exist_ok=True)
+            
             # Check if this is the first write (file doesn't exist yet)
             is_first_write = not os.path.exists(TRADES_FILE)
             with open(TRADES_FILE, "a") as f:
                 f.write(json.dumps(trade_data) + "\n")
+                f.flush()
+            
             if is_first_write:
-                print(f"[PAPER] Trade log append ok: {TRADES_FILE}")
+                print(f"[PAPER] Trade log created: {TRADES_FILE}")
+            # D2: Log success with trade details
+            print(f"[PAPER] Trade logged: {trade_data.get('side')} {trade_data.get('size')}@{trade_data.get('price')} on '{trade_data.get('market_title', '')[:30]}...'")
         except Exception as e:
             print(f"[!] Failed to log paper trade: {e}")
 

@@ -69,14 +69,18 @@ class TrendTracker:
     def __init__(self, config: Dict):
         self.config = config
         
-        # Thresholds from config
-        self.min_data_seconds = config.get("TREND_MIN_DATA_SECONDS", 30)
-        self.min_history_minutes = config.get("TREND_MIN_HISTORY_MINUTES", 15)
+        # Thresholds from config - reduced for 1H markets
+        self.min_data_seconds = config.get("TREND_MIN_DATA_SECONDS", 10)
+        self.min_history_minutes = config.get("TREND_MIN_HISTORY_MINUTES", 0.5)  # 30 seconds
         self.trendiness_threshold = config.get("TREND_TRENDINESS_THRESHOLD", 0.3)
         self.breakout_ticks = config.get("TREND_BREAKOUT_TICKS", 1)
         self.return_threshold = config.get("TREND_RETURN_THRESHOLD", 0.005)
         self.cooldown_minutes = config.get("TREND_COOLDOWN_MINUTES", 30)
         self.time_left_threshold = config.get("TREND_TIME_LEFT_THRESHOLD", 12)
+        
+        # New: min history requirements (configurable)
+        self.min_history_points = config.get("TREND_MIN_HISTORY_POINTS", 20)
+        self.min_history_seconds = config.get("TREND_MIN_HISTORY_SECONDS", 10)
         
         # Exit thresholds
         self.tp_ticks = config.get("TREND_TP_TICKS", 8)
@@ -128,20 +132,51 @@ class TrendTracker:
             if not buffer or len(buffer) < 2:
                 return False, "INSUFFICIENT_DATA"
             
-            # Check last update is recent (< 10 seconds)
+            # Check last update is recent (< min_data_seconds)
             last_price, last_time = self.last_prices.get(token_id, (None, 0))
             if last_price is None:
                 return False, "NO_LAST_PRICE"
             
-            if time.time() - last_time > 10:
+            if time.time() - last_time > self.min_data_seconds:
                 return False, "STALE_DATA"
             
-            # Check we have enough history (15 minutes)
+            # Check we have enough history (configurable - default 30 seconds)
             first_point = buffer[0]
-            if time.time() - first_point.timestamp < self.min_history_minutes * 60:
-                return False, "INSUFFICIENT_HISTORY"
+            history_span = time.time() - first_point.timestamp
+            
+            # Use new config-based requirements
+            has_enough_points = len(buffer) >= self.min_history_points
+            has_enough_time = history_span >= self.min_history_seconds
+            
+            if not has_enough_points or not has_enough_time:
+                reason = "INSUFFICIENT_HISTORY"
+                return False, f"{reason}:points={len(buffer)}/{self.min_history_points},span={history_span:.1f}s/{self.min_history_seconds}s"
             
             return True, "OK"
+    
+    def get_history_status(self, token_id: str) -> dict:
+        """Get detailed history status for diagnostics."""
+        with self._lock:
+            buffer = self.price_buffers.get(token_id, [])
+            last_price, last_time = self.last_prices.get(token_id, (None, 0))
+            
+            history_span = 0
+            if buffer:
+                first_point = buffer[0]
+                history_span = time.time() - first_point.timestamp
+            
+            last_age = time.time() - last_time if last_time else 999
+            
+            return {
+                "token_id": token_id[:12] + "..." if len(token_id) > 12 else token_id,
+                "points": len(buffer),
+                "span_seconds": history_span,
+                "last_age": last_age,
+                "last_price": last_price,
+                "min_points": self.min_history_points,
+                "min_seconds": self.min_history_seconds,
+                "sane": len(buffer) >= self.min_history_points and history_span >= self.min_history_seconds
+            }
     
     def compute_trendiness(self, token_id: str) -> float:
         """Layer 1: Compute trendiness score.
