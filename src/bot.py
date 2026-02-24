@@ -197,6 +197,10 @@ class TradingBot:
         self._last_decision_market = None
         self._last_decision_signal = None
         
+        # F3: Market switch detection - track previous token pair for proper switch detection
+        self._last_yes_token = None
+        self._last_no_token = None
+        
         # Activity watchdog for forced trades
         force_mode = self.config.get("PAPER_FORCE_MODE", "OFF")
         if force_mode != "OFF":
@@ -258,6 +262,9 @@ class TradingBot:
                     self._current_condition_id = selected.get('condition_id', '')
                     self._current_yes_token = yes_token
                     self._current_no_token = no_token
+                    # F3: Initialize token tracking for market switch detection
+                    self._last_yes_token = yes_token
+                    self._last_no_token = no_token
                 else:
                     self.clob_websocket.update_market_cache(markets)
                 self.clob_websocket.start()
@@ -355,6 +362,9 @@ class TradingBot:
         self._current_condition_id = None
         self._current_yes_token = None
         self._current_no_token = None
+        # F3: Initialize token tracking for market switch detection
+        self._last_yes_token = None
+        self._last_no_token = None
         
         # Config values for rollover
         self._rollover_buffer_seconds = self.config.get("ROLLOVER_BUFFER_SECONDS", 20)
@@ -414,15 +424,17 @@ class TradingBot:
             if self.is_btc_1h_only and markets:
                 # Get the first market (selected by market.py priority)
                 first_market = markets[0]
-                in_window = first_market.get('in_window', False)
                 minutes_left = first_market.get('minutes_left')
                 minutes_to_start = first_market.get('minutes_to_start')
                 current_condition_id = first_market.get('condition_id', '')
                 current_yes_token = first_market.get('yes_token_id', '')
                 current_no_token = first_market.get('no_token_id', '')
-                entry_allowed = first_market.get('entry_allowed', False)
-                entry_reason = first_market.get('entry_reason', 'unknown')
                 cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
+                # F3: Compute in_window and entry_allowed consistently
+                in_window = minutes_left is not None and minutes_left > cutoff
+                accepting = first_market.get('accepting_orders', False)
+                entry_allowed = in_window and accepting
+                entry_reason = "allowed_live" if entry_allowed else "blocked_cutoff"
                 
                 # A4: Throttle SELECT AUDIT - only print when state changes
                 now_utc = datetime.now(timezone.utc).isoformat()
@@ -452,20 +464,45 @@ class TradingBot:
                     self._last_audit_is_live = in_window
                 
                 # ── ROLLOVER DETECTION: Check if market changed or expired ──
-                # Rollover triggers: condition_id changed OR market ended (minutes_left <= 0)
+                # F3: Also check token pair change (not just condition_id)
+                token_pair_changed = (current_yes_token != self._last_yes_token) or (current_no_token != self._last_no_token)
                 market_ended = minutes_left is not None and minutes_left <= 0
-                market_changed = current_condition_id != self._current_condition_id
+                market_changed = (current_condition_id != self._current_condition_id) or token_pair_changed
                 
                 if market_changed or market_ended:
+                    old_yes = (self._last_yes_token or '')[:20]
+                    old_no = (self._last_no_token or '')[:20]
+                    new_yes = current_yes_token[:20]
+                    new_no = current_no_token[:20]
                     old_title = self._current_condition_id[:30] if self._current_condition_id else "None"
                     new_title = first_market.get('title', current_condition_id)[:50]
                     reason = "market_changed" if market_changed else "market_ended"
-                    print(f"[ROLLOVER] {reason}: {old_title} -> {new_title}")
+                    print(f"[MARKET SWITCH] {reason}: {old_title}")
+                    print(f"  old_yes={old_yes}... old_no={old_no}...")
+                    print(f"  new_yes={new_yes}... new_no={new_no}...")
                     
                     # Update tracking
                     self._current_condition_id = current_condition_id
                     self._current_yes_token = current_yes_token
                     self._current_no_token = current_no_token
+                    self._last_yes_token = current_yes_token
+                    self._last_no_token = current_no_token
+                    
+                    # F3: Clear old strategy buffers before re-registering
+                    if hasattr(self, 'momentum_strategy') and token_pair_changed:
+                        ms = self.momentum_strategy
+                        # Clear old token entries from token_to_market
+                        old_tokens = [t for t in ms.token_to_market.keys() if t != current_yes_token and t != current_no_token]
+                        for old_token in old_tokens:
+                            del ms.token_to_market[old_token]
+                        # Clear old price buffers for fresh start
+                        if hasattr(ms.tracker, 'price_buffers'):
+                            ms.tracker.price_buffers.clear()
+                        if hasattr(ms.tracker, 'last_prices'):
+                            ms.tracker.last_prices.clear()
+                        if hasattr(ms.tracker, 'ma_buffers'):
+                            ms.tracker.ma_buffers.clear()
+                        print(f"[MARKET SWITCH] Cleared {len(old_tokens)} old tokens from strategy")
                     
                     # F2: Re-register tokens with momentum strategy on market change
                     if hasattr(self, 'momentum_strategy') and current_yes_token and current_no_token:
@@ -474,7 +511,7 @@ class TradingBot:
                         was_registered = self.momentum_strategy.register_market(
                             current_condition_id, current_yes_token, current_no_token, title, end_date=end_date
                         )
-                        print(f"[ROLLOVER] Strategy re-registered: {was_registered} for {title[:40]}...")
+                        print(f"[WS RESUBSCRIBE] Strategy re-registered: {was_registered} for {title[:40]}...")
                     
                     # Resubscribe to new market
                     if self.clob_websocket and self.clob_websocket.running:
@@ -484,8 +521,10 @@ class TradingBot:
                         self.clob_websocket._market_condition_ids = {current_condition_id}
                         self.clob_websocket._yes_token_id = current_yes_token
                         self.clob_websocket._no_token_id = current_no_token
-                        # F3: Rollover proof line
-                        print(f"[ROLLOVER] WS reset; now subscribed YES={current_yes_token[:16]}... NO={current_no_token[:16]}...")
+                        # F3: Trigger actual resubscription
+                        if hasattr(self.clob_websocket, '_subscribe_to_tokens'):
+                            self.clob_websocket._subscribe_to_tokens()
+                        print(f"[WS RESUBSCRIBE] WS reset; now subscribed YES={current_yes_token[:16]}... NO={current_no_token[:16]}...")
                 
                 # Check for UPCOMING -> IN_WINDOW transition
                 if in_window and not self._was_in_window:
@@ -586,7 +625,9 @@ class TradingBot:
                 minutes_left = first_market.get('minutes_left')
                 cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
                 in_window = minutes_left is not None and minutes_left > cutoff
-                entry_allowed = first_market.get('entry_allowed', False)
+                # F3: Compute entry_allowed consistently - same formula as DECISION section
+                accepting = first_market.get('accepting_orders', False)
+                entry_allowed = in_window and accepting
                 
                 # F3: Decision heartbeat - print every 30 seconds
                 if now - getattr(self, '_last_decision_tick_log', 0) >= 30:
@@ -596,12 +637,23 @@ class TradingBot:
             # F1 & F5: DECISION trace - deterministic chain when evaluating momentum strategy
             # Also add explicit skip reasons
             if self.is_btc_1h_only:
+                # A) Check throttle for decision evaluation
+                decision_interval = self.config.get("MOMENTUM_DECISION_LOG_INTERVAL", 30)
+                time_since_last = now - self._last_decision_log_time
+                can_run_decision = time_since_last >= decision_interval
+                
                 if not markets:
                     # F5: Explicit skip reason - no markets
                     if now - getattr(self, '_last_skip_log', 0) >= 30:
                         print(f"[DECISION SKIP] no_markets_available")
                         self._last_skip_log = now
-                elif now - self._last_decision_log_time >= self.config.get("MOMENTUM_DECISION_LOG_INTERVAL", 30):
+                elif not can_run_decision:
+                    # F5: Skip because throttle not ready
+                    if now - getattr(self, '_last_skip_log', 0) >= 30:
+                        seconds_waiting = decision_interval - time_since_last
+                        print(f"[DECISION SKIP] throttle_not_ready wait={seconds_waiting:.0f}s")
+                        self._last_skip_log = now
+                else:
                     # Get current selected market info
                     first_market = markets[0]
                     current_condition_id = first_market.get('condition_id', '')
@@ -609,8 +661,8 @@ class TradingBot:
                     # Get price status
                     yes_token = first_market.get('yes_token_id', '')
                     no_token = first_market.get('no_token_id', '')
-                    yes_price = first_market.get('yes_price', 0)
-                    no_price = first_market.get('no_price', 0)
+                    yes_price = first_market.get('yes_price', 0.5)
+                    no_price = first_market.get('no_price', 0.5)
                     
                     # Get strategy evaluation status
                     strategy_status = "UNKNOWN"
@@ -649,26 +701,56 @@ class TradingBot:
                             now_ts - ws_no_ts if ws_no_ts else 999
                         )
                         
-                        # F9: Price consistency audit
-                        display_yes = yes_price
+                        # F9: Price consistency audit - track initial market API prices vs current shown prices
+                        cache_yes = first_market.get('yes_price', 0.5)  # Original from market API
+                        cache_no = first_market.get('no_price', 0.5)
+                        display_yes = yes_price  # Current shown (may be WS override)
                         display_no = no_price
-                        mismatch = False
-                        if ws_yes_price is not None and abs(ws_yes_price - display_yes) > 0.01:
-                            mismatch = True
-                        if ws_no_price is not None and abs(ws_no_price - display_no) > 0.01:
-                            mismatch = True
+                        
+                        # Determine source and mismatch
+                        has_ws = (ws_yes_price is not None and ws_no_price is not None)
+                        source = "ws" if has_ws else "cached"
+                        
+                        # Check if current display differs from initial cache
+                        mismatch = "unknown"
+                        if has_ws:
+                            if abs(ws_yes_price - cache_yes) > 0.01 or abs(ws_no_price - cache_no) > 0.01:
+                                mismatch = "ws_vs_cache"
+                            else:
+                                mismatch = False
+                        elif cache_yes > 0 and cache_no > 0:
+                            mismatch = False  # Using cached, assume consistent
                         
                         # Log price consistency every 30s
                         if now - getattr(self, '_last_price_consistency_log', 0) >= 30:
-                            source = "ws" if (ws_yes_price is not None and ws_no_price is not None) else "fallback_cached"
-                            print(f"[PRICE CONSISTENCY] ws_yes={ws_yes_price:.4f} ws_no={ws_no_price:.4f} display_yes={display_yes:.4f} display_no={display_no:.4f} source={source} mismatch={mismatch}")
+                            try:
+                                # Safe formatting helper
+                                def fmt_price(p):
+                                    return f"{p:.4f}" if p is not None else "None"
+                                
+                                print(f"[PRICE CONSISTENCY] source={source} shown={fmt_price(display_yes)}/{fmt_price(display_no)} cache={fmt_price(cache_yes)}/{fmt_price(cache_no)} ws={fmt_price(ws_yes_price)}/{fmt_price(ws_no_price)} mismatch={mismatch}")
+                            except Exception as e:
+                                print(f"[PRICE CONSISTENCY ERROR] {e}")
                             self._last_price_consistency_log = now
+                        
+                        # F5: WS warmup visibility
+                        ws_warm = (ws_yes_price is None or ws_no_price is None)
+                        if ws_warm and now - getattr(self, '_last_ws_warmup_log', 0) >= 30:
+                            try:
+                                def fmt_price(p):
+                                    return f"{p:.4f}" if p is not None else "None"
+                                print(f"[WS WARMUP] ws_yes={fmt_price(ws_yes_price)} ws_no={fmt_price(ws_no_price)} using_cached_display=True")
+                            except Exception as e:
+                                print(f"[WS WARMUP ERROR] {e}")
+                            self._last_ws_warmup_log = now
                         
                         # Use WS prices if available for display
                         if ws_yes_price is not None:
                             yes_price = ws_yes_price
+                            display_yes = ws_yes_price  # Sync for consistency comparison
                         if ws_no_price is not None:
                             no_price = ws_no_price
+                            display_no = ws_no_price  # Sync for consistency comparison
                         
                         # Check if prices are flowing
                         yes_ts = ws_yes_ts
@@ -719,7 +801,7 @@ class TradingBot:
                     if not entry_allowed:
                         no_trade_reason = "blocked_cutoff"
                     
-                    # F10: Token identity sanity check
+                    # F10: Token identity sanity check with status
                     norm_yes = yes_token[:20] if len(yes_token) > 20 else yes_token
                     norm_no = no_token[:20] if len(no_token) > 20 else no_token
                     ws_yes = getattr(self.clob_websocket, '_yes_token_id', '')[:20] if self.clob_websocket else ''
@@ -728,15 +810,23 @@ class TradingBot:
                     strat_no = list(self.momentum_strategy.token_to_market.keys())[1][:20] if self.momentum_strategy and len(self.momentum_strategy.token_to_market) > 1 else ''
                     all_match = (norm_yes == ws_yes == strat_yes) and (norm_no == ws_no == strat_no)
                     
-                    if now - getattr(self, '_last_token_map_log', 0) >= 60:
-                        print(f"[TOKEN MAP] selected_yes={norm_yes[:16]}... selected_no={norm_no[:16]}... ws_yes={ws_yes[:16]}... ws_no={ws_no[:16]}... strat_yes={strat_yes[:16]}... strat_no={strat_no[:16]}... all_match={all_match}")
+                    # Determine status
+                    if not ws_yes and not ws_no:
+                        token_status = "warmup_no_ws"
+                    elif all_match:
+                        token_status = "ready_match"
+                    else:
+                        token_status = "mismatch"
+                    
+                    if now - getattr(self, '_last_token_map_log', 0) >= 30:
+                        print(f"[TOKEN MAP] status={token_status} selected={norm_yes[:12]}.../{norm_no[:12]}... ws={ws_yes[:12]}.../{ws_no[:12]}... strat={strat_yes[:12]}.../{strat_no[:12]}... all_match={all_match}")
                         self._last_token_map_log = now
                     
                     # Only log when something significant changes or on interval
                     market_changed = (current_condition_id != self._last_decision_market)
                     signal_changed = (last_signal != self._last_decision_signal)
                     
-                    if market_changed or signal_changed or (now - self._last_decision_log_time) >= 60:
+                    if market_changed or signal_changed or (now - self._last_decision_log_time) >= 30:
                         print(f"\n[DECISION]")
                         print(f"  market={first_market.get('title', '')[:40]}...")
                         print(f"  is_live={is_live} in_window={in_window} accepting={accepting} entry_allowed={entry_allowed}")
