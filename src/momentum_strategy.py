@@ -513,22 +513,31 @@ class TrendStrategy:
         
         Note: WS price is the last_trade_price from CLOB, which is a trade-weighted
         price. This is appropriate for momentum signals.
+        
+        CRITICAL: Normalize token_id - WebSocket may return extended format
+        (e.g., 30 digits) while Gamma API returns shorter format (20 digits).
+        Truncate to first 20 digits for matching.
         """
+        # Normalize token_id: truncate to 20 digits if longer
+        # (Gamma returns 20-digit IDs, WebSocket may return extended format)
+        normalized_token_id = token_id[:20] if len(token_id) > 20 else token_id
+        
         # DEBUG: Heartbeat to diagnose price update flow
         # Print no more than once every 5 seconds
         now = time.time()
         last_debug = getattr(self, '_last_price_debug', 0)
         if now - last_debug > 5:
-            buffer_len = len(self.tracker.price_buffers.get(token_id, []))
-            print(f"[PRICE DEBUG] token={token_id[:20]}... price={price} buffer_len={buffer_len}")
+            buffer_len = len(self.tracker.price_buffers.get(normalized_token_id, []))
+            print(f"[PRICE DEBUG] token={normalized_token_id[:20]}... price={price} buffer_len={buffer_len}")
             self._last_price_debug = now
         
         # CRITICAL: Track WS updates for health check
         if source == "ws":
             self._last_ws_update_ts = now
         
-        self.tracker.update_price(token_id, price, source)
-        self._process_signals(token_id)
+        # Use normalized token_id for storage and processing
+        self.tracker.update_price(normalized_token_id, price, source)
+        self._process_signals(normalized_token_id)
     
     def poll_prices(self, market_service, source: str = "rest"):
         """Poll prices from REST API (fallback mode).

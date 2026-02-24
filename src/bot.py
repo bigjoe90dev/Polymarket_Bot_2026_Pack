@@ -108,7 +108,8 @@ class TradingBot:
                     self.momentum_strategy.on_price_update(token_id, price, source="ws")
             
             try:
-                self.clob_websocket = CLOBWebSocketMonitor(config, on_price_update)
+                # Pass None for whale_tracker (not needed in BTC_1H_ONLY), and on_price_update as price_callback
+                self.clob_websocket = CLOBWebSocketMonitor(config, None, on_price_update)
                 print("[*] CLOB WebSocket initialized for REAL-TIME prices (momentum strategy)")
             except Exception as e:
                 print(f"[!] CLOB WebSocket failed to initialize: {e}")
@@ -250,7 +251,8 @@ class TradingBot:
                     yes_token = selected.get('yes_token_id', '')
                     no_token = selected.get('no_token_id', '')
                     print(f"[*] SELECTED MARKET: {selected.get('title', '')[:50]}...")
-                    print(f"[*] Subscribing to YES={yes_token[:20]}... NO={no_token[:20]}...")
+                    # F2: WS subscription proof line
+                    print(f"[WS SUB] YES={yes_token[:20]}... NO={no_token[:20]}...")
                     self.clob_websocket.update_market_cache(selected_market)
                     # Initialize tracking for first selected market
                     self._current_condition_id = selected.get('condition_id', '')
@@ -465,6 +467,15 @@ class TradingBot:
                     self._current_yes_token = current_yes_token
                     self._current_no_token = current_no_token
                     
+                    # F2: Re-register tokens with momentum strategy on market change
+                    if hasattr(self, 'momentum_strategy') and current_yes_token and current_no_token:
+                        title = first_market.get('title', '')
+                        end_date = first_market.get('end_date')
+                        was_registered = self.momentum_strategy.register_market(
+                            current_condition_id, current_yes_token, current_no_token, title, end_date=end_date
+                        )
+                        print(f"[ROLLOVER] Strategy re-registered: {was_registered} for {title[:40]}...")
+                    
                     # Resubscribe to new market
                     if self.clob_websocket and self.clob_websocket.running:
                         selected_market = [first_market]
@@ -473,7 +484,8 @@ class TradingBot:
                         self.clob_websocket._market_condition_ids = {current_condition_id}
                         self.clob_websocket._yes_token_id = current_yes_token
                         self.clob_websocket._no_token_id = current_no_token
-                        print(f"[ROLLOVER] Resubscribed to new market: YES={current_yes_token[:20]}... NO={current_no_token[:20]}...")
+                        # F3: Rollover proof line
+                        print(f"[ROLLOVER] WS reset; now subscribed YES={current_yes_token[:16]}... NO={current_no_token[:16]}...")
                 
                 # Check for UPCOMING -> IN_WINDOW transition
                 if in_window and not self._was_in_window:
@@ -503,11 +515,36 @@ class TradingBot:
                         pass  # Suppress errors
                     self._last_price_update = now
                     
-                    # Print current market prices
+                    # F8: Use WS-derived prices for display (same source as strategy)
+                    yes_token = first_market.get('yes_token_id', '')
+                    no_token = first_market.get('no_token_id', '')
+                    
+                    # Normalize token IDs
+                    norm_yes = yes_token[:20] if len(yes_token) > 20 else yes_token
+                    norm_no = no_token[:20] if len(no_token) > 20 else no_token
+                    
+                    # Try to get WS-derived prices from momentum strategy
                     yes_p = first_market.get('yes_price', 0)
                     no_p = first_market.get('no_price', 0)
+                    price_source = "cached"
+                    
+                    if hasattr(self, 'momentum_strategy'):
+                        ms = self.momentum_strategy
+                        yes_data = ms.tracker.last_prices.get(norm_yes, (None, None))
+                        no_data = ms.tracker.last_prices.get(norm_no, (None, None))
+                        
+                        if yes_data[0] is not None:
+                            yes_p = yes_data[0]
+                            price_source = "ws"
+                        if no_data[0] is not None:
+                            no_p = no_data[0]
+                            if price_source == "ws":
+                                price_source = "ws"
+                            else:
+                                price_source = "ws"
+                    
                     last_update = first_market.get('last_update_time', '')[:19]
-                    print(f"[*] 📊 Live: {first_market.get('title', '')[:40]}... YES:${yes_p:.2f} NO:${no_p:.2f} @ {last_update}")
+                    print(f"[*] 📊 Live: {first_market.get('title', '')[:40]}... YES:${yes_p:.2f} NO:${no_p:.2f} source={price_source} @ {last_update}")
             elif not markets and (now - self._last_heartbeat_log >= 60):
                 # No markets at all - heartbeat log
                 print(f"[*] 💤 Waiting: no active markets, retrying...")
@@ -542,99 +579,189 @@ class TradingBot:
                 clob_signals = []
                 polled_signals = []
 
-            # A4: DECISION trace - deterministic chain when evaluating momentum strategy
-            if self.is_btc_1h_only and markets and now - self._last_decision_log_time >= self.config.get("MOMENTUM_DECISION_LOG_INTERVAL", 30):
-                # Get current selected market info
+            # F1: DECISION TICK heartbeat - runs every cycle to prove evaluation loop is alive
+            if self.is_btc_1h_only and markets:
                 first_market = markets[0]
                 current_condition_id = first_market.get('condition_id', '')
+                minutes_left = first_market.get('minutes_left')
+                cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
+                in_window = minutes_left is not None and minutes_left > cutoff
+                entry_allowed = first_market.get('entry_allowed', False)
                 
-                # Get price status
-                yes_token = first_market.get('yes_token_id', '')
-                no_token = first_market.get('no_token_id', '')
-                yes_price = first_market.get('yes_price', 0)
-                no_price = first_market.get('no_price', 0)
-                
-                # Get strategy evaluation status
-                strategy_status = "UNKNOWN"
-                last_signal = "NONE"
-                price_age = 999
-                ws_status = "UNKNOWN"
-                no_trade_reason = "N/A"
-                
-                if hasattr(self, 'momentum_strategy'):
-                    ms = self.momentum_strategy
-                    # Check if prices are flowing
-                    yes_ts = ms.tracker.last_prices.get(yes_token, (None, None))[1]
-                    no_ts = ms.tracker.last_prices.get(no_token, (None, None))[1]
-                    price_age = max(
-                        now - yes_ts if yes_ts else 999,
-                        now - no_ts if no_ts else 999
-                    )
+                # F3: Decision heartbeat - print every 30 seconds
+                if now - getattr(self, '_last_decision_tick_log', 0) >= 30:
+                    print(f"[DECISION TICK] market={first_market.get('title', '')[:40]}... in_window={in_window} entry_allowed={entry_allowed}")
+                    self._last_decision_tick_log = now
+
+            # F1 & F5: DECISION trace - deterministic chain when evaluating momentum strategy
+            # Also add explicit skip reasons
+            if self.is_btc_1h_only:
+                if not markets:
+                    # F5: Explicit skip reason - no markets
+                    if now - getattr(self, '_last_skip_log', 0) >= 30:
+                        print(f"[DECISION SKIP] no_markets_available")
+                        self._last_skip_log = now
+                elif now - self._last_decision_log_time >= self.config.get("MOMENTUM_DECISION_LOG_INTERVAL", 30):
+                    # Get current selected market info
+                    first_market = markets[0]
+                    current_condition_id = first_market.get('condition_id', '')
                     
-                    # Get latest decision from log
-                    if ms.tracker.decisions_log:
-                        last_decision = ms.tracker.decisions_log[-1]
-                        last_signal = f"{last_decision.action}:{last_decision.reason[:20]}"
+                    # Get price status
+                    yes_token = first_market.get('yes_token_id', '')
+                    no_token = first_market.get('no_token_id', '')
+                    yes_price = first_market.get('yes_price', 0)
+                    no_price = first_market.get('no_price', 0)
                     
-                    # C1: Determine why no trade - explicit reasons
-                    # Check history status for YES token
-                    yes_history = ms.tracker.get_history_status(yes_token)
-                    no_history = ms.tracker.get_history_status(no_token)
+                    # Get strategy evaluation status
+                    strategy_status = "UNKNOWN"
+                    last_signal = "NONE"
+                    price_age = 999
+                    ws_status = "UNKNOWN"
+                    no_trade_reason = "N/A"
                     
-                    if self._ws_is_stale:
-                        no_trade_reason = "ws_stale"
-                    elif price_age > 60:
-                        no_trade_reason = "no_price_updates"
-                    elif not yes_history.get("sane", False):
-                        no_trade_reason = "insufficient_history"
-                    elif last_signal.startswith("HOLD"):
-                        # Extract the actual HOLD reason
-                        if "trend=" in last_signal:
-                            no_trade_reason = "threshold_not_met"
-                        else:
-                            no_trade_reason = last_signal.split(":", 1)[1] if ":" in last_signal else "unknown"
-                    elif not entry_allowed:
+                    if hasattr(self, 'momentum_strategy'):
+                        ms = self.momentum_strategy
+                        # F8: Get WS-derived prices for display consistency
+                        # Normalize token IDs to first 20 digits for lookup
+                        norm_yes = yes_token[:20] if len(yes_token) > 20 else yes_token
+                        norm_no = no_token[:20] if len(no_token) > 20 else no_token
+                        
+                        # Get latest prices from strategy tracker (WS-derived)
+                        ws_yes_price = None
+                        ws_no_price = None
+                        ws_yes_ts = None
+                        ws_no_ts = None
+                        
+                        yes_data = ms.tracker.last_prices.get(norm_yes, (None, None))
+                        no_data = ms.tracker.last_prices.get(norm_no, (None, None))
+                        
+                        if yes_data[0] is not None:
+                            ws_yes_price = yes_data[0]
+                            ws_yes_ts = yes_data[1]
+                        if no_data[0] is not None:
+                            ws_no_price = no_data[0]
+                            ws_no_ts = no_data[1]
+                        
+                        # Price age from WS
+                        now_ts = time.time()
+                        price_age = max(
+                            now_ts - ws_yes_ts if ws_yes_ts else 999,
+                            now_ts - ws_no_ts if ws_no_ts else 999
+                        )
+                        
+                        # F9: Price consistency audit
+                        display_yes = yes_price
+                        display_no = no_price
+                        mismatch = False
+                        if ws_yes_price is not None and abs(ws_yes_price - display_yes) > 0.01:
+                            mismatch = True
+                        if ws_no_price is not None and abs(ws_no_price - display_no) > 0.01:
+                            mismatch = True
+                        
+                        # Log price consistency every 30s
+                        if now - getattr(self, '_last_price_consistency_log', 0) >= 30:
+                            source = "ws" if (ws_yes_price is not None and ws_no_price is not None) else "fallback_cached"
+                            print(f"[PRICE CONSISTENCY] ws_yes={ws_yes_price:.4f} ws_no={ws_no_price:.4f} display_yes={display_yes:.4f} display_no={display_no:.4f} source={source} mismatch={mismatch}")
+                            self._last_price_consistency_log = now
+                        
+                        # Use WS prices if available for display
+                        if ws_yes_price is not None:
+                            yes_price = ws_yes_price
+                        if ws_no_price is not None:
+                            no_price = ws_no_price
+                        
+                        # Check if prices are flowing
+                        yes_ts = ws_yes_ts
+                        no_ts = ws_no_ts
+                        
+                        # Get latest decision from log
+                        if ms.tracker.decisions_log:
+                            last_decision = ms.tracker.decisions_log[-1]
+                            last_signal = f"{last_decision.action}:{last_decision.reason[:20]}"
+                        
+                        # C1: Determine why no trade - explicit reasons
+                        # Check history status for YES token
+                        yes_history = ms.tracker.get_history_status(norm_yes)
+                        no_history = ms.tracker.get_history_status(norm_no)
+                        
+                        if self._ws_is_stale:
+                            no_trade_reason = "ws_stale"
+                        elif price_age > 60:
+                            no_trade_reason = "no_price_updates"
+                        elif not yes_history.get("sane", False):
+                            no_trade_reason = "insufficient_history"
+                        elif last_signal.startswith("HOLD"):
+                            # Extract the actual HOLD reason
+                            if "trend=" in last_signal:
+                                no_trade_reason = "threshold_not_met"
+                            else:
+                                no_trade_reason = last_signal.split(":", 1)[1] if ":" in last_signal else "unknown"
+                        
+                        ws_status = "STALE" if self._ws_is_stale else "HEALTHY"
+                        strategy_status = f"price_age={price_age:.1f}s"
+                    else:
+                        # Fallback values when momentum_strategy not available
+                        yes_history = {"sane": False, "points": 0, "span_seconds": 0, "last_age": 999, "min_points": 20, "min_seconds": 10, "token_id": "N/A"}
+                        no_history = {"sane": False, "points": 0, "span_seconds": 0, "last_age": 999, "min_points": 20, "min_seconds": 10, "token_id": "N/A"}
+                        price_age = 999
+                        last_signal = "NONE"
+                        ws_status = "NO_STRATEGY"
+                    
+                    # F5: Check entry_allowed AFTER it's defined
+                    minutes_left = first_market.get('minutes_left')
+                    cutoff = self.config.get("NO_TRADE_LAST_MINUTES", 10)
+                    is_live = minutes_left is not None and minutes_left > 0
+                    in_window = minutes_left is not None and minutes_left > cutoff
+                    accepting = first_market.get('accepting_orders', False)
+                    entry_allowed = in_window and accepting
+                    
+                    # Now check entry_allowed
+                    if not entry_allowed:
                         no_trade_reason = "blocked_cutoff"
                     
-                    ws_status = "STALE" if self._ws_is_stale else "HEALTHY"
-                    strategy_status = f"price_age={price_age:.1f}s"
-                
-                # Check if market is tradable
-                minutes_left = first_market.get('minutes_left')
-                in_window = minutes_left is not None and minutes_left > self.config.get("NO_TRADE_LAST_MINUTES", 10)
-                accepting = first_market.get('accepting_orders', False)
-                entry_allowed = in_window and accepting
-                
-                # Only log when something significant changes or on interval
-                market_changed = (current_condition_id != self._last_decision_market)
-                signal_changed = (last_signal != self._last_decision_signal)
-                
-                if market_changed or signal_changed or (now - self._last_decision_log_time) >= 60:
-                    print(f"\n[DECISION]")
-                    print(f"  market={first_market.get('title', '')[:40]}...")
-                    print(f"  in_window={in_window} accepting={accepting} entry_allowed={entry_allowed}")
-                    print(f"  minutes_left={minutes_left}")
-                    print(f"  prices: YES={yes_price:.4f} NO={no_price:.4f}")
-                    print(f"  ws_status: {ws_status} (price_age={price_age:.1f}s)")
-                    print(f"  last_signal: {last_signal}")
-                    print(f"  no_trade_because: {no_trade_reason}")
-                    print(f"  force_mode: {self._force_mode}")
+                    # F10: Token identity sanity check
+                    norm_yes = yes_token[:20] if len(yes_token) > 20 else yes_token
+                    norm_no = no_token[:20] if len(no_token) > 20 else no_token
+                    ws_yes = getattr(self.clob_websocket, '_yes_token_id', '')[:20] if self.clob_websocket else ''
+                    ws_no = getattr(self.clob_websocket, '_no_token_id', '')[:20] if self.clob_websocket else ''
+                    strat_yes = list(self.momentum_strategy.token_to_market.keys())[0][:20] if self.momentum_strategy and self.momentum_strategy.token_to_market else ''
+                    strat_no = list(self.momentum_strategy.token_to_market.keys())[1][:20] if self.momentum_strategy and len(self.momentum_strategy.token_to_market) > 1 else ''
+                    all_match = (norm_yes == ws_yes == strat_yes) and (norm_no == ws_no == strat_no)
                     
-                    # A: History diagnostics
-                    print(f"\n[HISTORY]")
-                    # YES token
-                    yes_sane = yes_history.get("sane", False)
-                    yes_status = "OK" if yes_sane else "FAIL"
-                    print(f"  YES {yes_history.get('token_id', 'N/A')} points={yes_history.get('points', 0)} span={yes_history.get('span_seconds', 0):.1f}s last_age={yes_history.get('last_age', 999):.1f}s (req >={yes_history.get('min_points', 20)}/>={yes_history.get('min_seconds', 10)}s) {yes_status}")
-                    # NO token
-                    no_sane = no_history.get("sane", False)
-                    no_status = "OK" if no_sane else "FAIL"
-                    print(f"  NO  {no_history.get('token_id', 'N/A')} points={no_history.get('points', 0)} span={no_history.get('span_seconds', 0):.1f}s last_age={no_history.get('last_age', 999):.1f}s (req >={no_history.get('min_points', 20)}/>={no_history.get('min_seconds', 10)}s) {no_status}")
-                    print()
+                    if now - getattr(self, '_last_token_map_log', 0) >= 60:
+                        print(f"[TOKEN MAP] selected_yes={norm_yes[:16]}... selected_no={norm_no[:16]}... ws_yes={ws_yes[:16]}... ws_no={ws_no[:16]}... strat_yes={strat_yes[:16]}... strat_no={strat_no[:16]}... all_match={all_match}")
+                        self._last_token_map_log = now
                     
-                    self._last_decision_market = current_condition_id
-                    self._last_decision_signal = last_signal
-                self._last_decision_log_time = now
+                    # Only log when something significant changes or on interval
+                    market_changed = (current_condition_id != self._last_decision_market)
+                    signal_changed = (last_signal != self._last_decision_signal)
+                    
+                    if market_changed or signal_changed or (now - self._last_decision_log_time) >= 60:
+                        print(f"\n[DECISION]")
+                        print(f"  market={first_market.get('title', '')[:40]}...")
+                        print(f"  is_live={is_live} in_window={in_window} accepting={accepting} entry_allowed={entry_allowed}")
+                        print(f"  minutes_left={minutes_left} cutoff={cutoff}")
+                        print(f"  prices: YES={yes_price:.4f} NO={no_price:.4f}")
+                        print(f"  ws_status: {ws_status} (price_age={price_age:.1f}s)")
+                        print(f"  last_signal: {last_signal}")
+                        print(f"  no_trade_because: {no_trade_reason}")
+                        print(f"  force_mode: {self._force_mode}")
+                        
+                        # A: History diagnostics
+                        print(f"\n[HISTORY]")
+                        # YES token
+                        yes_sane = yes_history.get("sane", False)
+                        yes_status = "OK" if yes_sane else "FAIL"
+                        print(f"  YES {yes_history.get('token_id', 'N/A')} points={yes_history.get('points', 0)} span={yes_history.get('span_seconds', 0):.1f}s last_age={yes_history.get('last_age', 999):.1f}s (req >={yes_history.get('min_points', 20)}/>={yes_history.get('min_seconds', 10)}s) {yes_status}")
+                        # NO token
+                        no_sane = no_history.get("sane", False)
+                        no_status = "OK" if no_sane else "FAIL"
+                        print(f"  NO  {no_history.get('token_id', 'N/A')} points={no_history.get('points', 0)} span={no_history.get('span_seconds', 0):.1f}s last_age={no_history.get('last_age', 999):.1f}s (req >={no_history.get('min_points', 20)}/>={no_history.get('min_seconds', 10)}s) {no_status}")
+                        print()
+                        
+                        self._last_decision_market = current_condition_id
+                        self._last_decision_signal = last_signal
+                    self._last_decision_log_time = now
             
             # Activity watchdog: Force trade if no trades for too long
             if self.is_btc_1h_only and self._force_mode != "OFF" and self.execution.paper_engine:
@@ -907,8 +1034,8 @@ class TradingBot:
                 except Exception:
                     pass
 
-            # v14: Periodic parity matching (every 5 minutes)
-            if self._cycle_count % 600 == 0:  # 600 cycles * 0.5s = 5 min
+            # E: Periodic parity matching (every 5 minutes) - skip in BTC_1H_ONLY mode
+            if not self.is_btc_1h_only and self._cycle_count % 600 == 0:  # 600 cycles * 0.5s = 5 min
                 try:
                     self.parity.run_matching()
                 except Exception as e:

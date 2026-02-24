@@ -581,21 +581,36 @@ class CLOBWebSocketMonitor:
         
         self._last_book_update[token_id] = time.time()
         
-        # DERIVE MID-PRICE: Only if both best_bid and best_ask exist
-        mid_price = None
+        # A: DERIVE PRICE - use ANY available source
+        derived_price = None
+        price_source = None
+        
+        # Priority 1: mid-price from both best_bid and best_ask
         if best_bid is not None and best_ask is not None:
-            mid_price = (best_bid + best_ask) / 2
-            # Sanity check: price should be between 0.01 and 0.99
-            if 0.01 <= mid_price <= 0.99:
-                # Call momentum callback with derived mid-price
-                if self.price_callback:
-                    try:
-                        self.price_callback(token_id, mid_price)
-                    except Exception:
-                        pass  # Silent fail for callback
-            else:
-                # Price out of range, skip
-                mid_price = None
+            derived_price = (best_bid + best_ask) / 2
+            price_source = "mid"
+        # Priority 2: best_bid only (one-sided book - bid side)
+        elif best_bid is not None:
+            derived_price = best_bid
+            price_source = "bid_only"
+        # Priority 3: best_ask only (one-sided book - ask side)
+        elif best_ask is not None:
+            derived_price = best_ask
+            price_source = "ask_only"
+        
+        # Accept price if 0 < price < 1 (allow 0.001, 0.999, etc.)
+        if derived_price is not None and 0 < derived_price < 1:
+            # Call momentum callback with derived price
+            if self.price_callback:
+                try:
+                    self.price_callback(token_id, derived_price)
+                    # A4: Update liveness timestamp on ANY valid update
+                    self._last_ws_update_ts = time.time()
+                except Exception:
+                    pass  # Silent fail for callback
+        else:
+            # Price out of range or None, skip
+            derived_price = None
         
         # Controlled debug logging (once per 5 seconds per token max)
         now = time.time()
@@ -607,8 +622,8 @@ class CLOBWebSocketMonitor:
             # Show None for missing sides
             bid_str = f"{best_bid:.4f}" if best_bid is not None else "None"
             ask_str = f"{best_ask:.4f}" if best_ask is not None else "None"
-            mid_str = f"{mid_price:.4f}" if mid_price is not None else "None"
-            print(f"[PRICE DEBUG] token={token_id[:20]}... mid={mid_str} best_bid={bid_str} best_ask={ask_str}")
+            derived_str = f"{derived_price:.4f}" if derived_price is not None else "None"
+            print(f"[PRICE DEBUG] token={token_id[:20]}... price={derived_str} best_bid={bid_str} best_ask={ask_str}")
 
     async def _handle_price_change(self, data: Dict):
         """Handle price_change event.
@@ -690,6 +705,9 @@ class CLOBWebSocketMonitor:
             # Call momentum callback if registered
             if self.price_callback:
                 try:
+                    # A4: Update liveness timestamp on ANY valid update
+                    self._last_ws_update_ts = time.time()
+                    
                     # DEBUG: Print first few price updates to diagnose
                     if hasattr(self, '_price_callback_count'):
                         self._price_callback_count += 1
