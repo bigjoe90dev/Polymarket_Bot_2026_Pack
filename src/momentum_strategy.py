@@ -724,9 +724,13 @@ class TrendStrategy:
                     else:
                         reason = f"no_breakout"
                 
-                # Format the log
+                # Format the log (safe float conversion to avoid invalid format specifier crash)
                 token_short = token_id[:12] + "..." if len(token_id) > 12 else token_id
-                print(f"[SIGNAL] market={market_title[:30]}... token={token_short} mid={current_price:.4f if current_price else 0:.4f} "
+                try:
+                    mid = float(current_price) if current_price is not None else 0.0
+                except Exception:
+                    mid = 0.0
+                print(f"[SIGNAL] market={market_title[:30]}... token={token_short} mid={mid:.4f} "
                       f"lookback=600s move={return_5min*100:.2f}% trend={trendiness:.2f} spread={spread_pct} liquidity={liquidity} "
                       f"decision={decision} reason={reason}")
             

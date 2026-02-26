@@ -202,6 +202,11 @@ class CLOBWebSocketMonitor:
         
         # For paper fill simulation
         self._last_book_update = defaultdict(float)
+        
+        # B) Allowed asset IDs for filtering - only process messages for these tokens
+        self.allowed_asset_ids: Set[str] = set()
+        self._ws_drop_count = 0  # Counter for dropped messages
+        self._last_ws_drop_log = 0
 
     def start(self):
         """Start WebSocket monitor in background thread."""
@@ -275,6 +280,43 @@ class CLOBWebSocketMonitor:
                     }
         
         print(f"[CLOB] Market cache updated: {len(self._market_cache)} markets (using token IDs from market.py)")
+
+    def switch_market(self, condition_id: str, yes_token_id: str, no_token_id: str):
+        """
+        Switch to monitoring a new market.
+        
+        Called when selected market changes - updates internal state and
+        triggers re-subscription on next poll cycle.
+        
+        Args:
+            condition_id: The market condition ID
+            yes_token_id: YES token ID
+            no_token_id: NO token ID
+        """
+        print(f"[CLOB] switch_market: switching to cid={condition_id[:20] if condition_id else 'NONE'}...")
+        
+        # Update internal tracking state
+        self._market_condition_ids = {condition_id}
+        self._yes_token_id = yes_token_id
+        self._no_token_id = no_token_id
+        
+        # Update market cache with only this market
+        with self._cache_lock:
+            self._market_cache = {
+                condition_id: {
+                    "condition_id": condition_id,
+                    "title": "",
+                    "yes_token_id": yes_token_id,
+                    "no_token_id": no_token_id,
+                    "yes_clob_token_id": yes_token_id,
+                    "no_clob_token_id": no_token_id,
+                }
+            }
+        
+        # Note: The actual WebSocket subscription will be refreshed automatically
+        # because _run_async_loop reads from _market_condition_ids on each subscription cycle
+        # This is handled by the async loop, not by a sync method call
+        print(f"[CLOB] switch_market: updated to YES={yes_token_id[:20] if yes_token_id else 'NONE'}... NO={no_token_id[:20] if no_token_id else 'NONE'}...")
 
     def _fetch_clob_token_ids_from_gamma(self, markets):
         """
@@ -600,14 +642,23 @@ class CLOBWebSocketMonitor:
         
         # Accept price if 0 < price < 1 (allow 0.001, 0.999, etc.)
         if derived_price is not None and 0 < derived_price < 1:
-            # Call momentum callback with derived price
-            if self.price_callback:
-                try:
-                    self.price_callback(token_id, derived_price)
-                    # A4: Update liveness timestamp on ANY valid update
-                    self._last_ws_update_ts = time.time()
-                except Exception:
-                    pass  # Silent fail for callback
+            # B) Filter: ignore messages not in allowed_asset_ids
+            if self.allowed_asset_ids and token_id not in self.allowed_asset_ids:
+                self._ws_drop_count += 1
+                now = time.time()
+                # Log throttled warning
+                if now - getattr(self, '_last_ws_drop_log', 0) >= 30:
+                    print(f"[WS DROP] asset_id_not_allowed count={self._ws_drop_count} example={token_id[:16]}...")
+                    self._last_ws_drop_log = now
+            else:
+                # Call momentum callback with derived price
+                if self.price_callback:
+                    try:
+                        self.price_callback(token_id, derived_price)
+                        # A4: Update liveness timestamp on ANY valid update
+                        self._last_ws_update_ts = time.time()
+                    except Exception:
+                        pass  # Silent fail for callback
         else:
             # Price out of range or None, skip
             derived_price = None
@@ -702,24 +753,33 @@ class CLOBWebSocketMonitor:
             
             self._last_book_update[asset_id] = time.time()
             
-            # Call momentum callback if registered
-            if self.price_callback:
-                try:
-                    # A4: Update liveness timestamp on ANY valid update
-                    self._last_ws_update_ts = time.time()
-                    
-                    # DEBUG: Print first few price updates to diagnose
-                    if hasattr(self, '_price_callback_count'):
-                        self._price_callback_count += 1
-                    else:
-                        self._price_callback_count = 1
-                    
-                    if self._price_callback_count <= 3:
-                        print(f"[CLOB CALLBACK] asset_id={asset_id[:30]}... price={price}")
-                    
-                    self.price_callback(asset_id, price)
-                except Exception as e:
-                    print(f"[CLOB] Callback error: {e}")
+            # B) Filter: ignore messages not in allowed_asset_ids
+            if self.allowed_asset_ids and asset_id not in self.allowed_asset_ids:
+                self._ws_drop_count += 1
+                now = time.time()
+                # Log throttled warning
+                if now - getattr(self, '_last_ws_drop_log', 0) >= 30:
+                    print(f"[WS DROP] asset_id_not_allowed count={self._ws_drop_count} example={asset_id[:16]}...")
+                    self._last_ws_drop_log = now
+            else:
+                # Call momentum callback if registered
+                if self.price_callback:
+                    try:
+                        # A4: Update liveness timestamp on ANY valid update
+                        self._last_ws_update_ts = time.time()
+                        
+                        # DEBUG: Print first few price updates to diagnose
+                        if hasattr(self, '_price_callback_count'):
+                            self._price_callback_count += 1
+                        else:
+                            self._price_callback_count = 1
+                        
+                        if self._price_callback_count <= 3:
+                            print(f"[CLOB CALLBACK] asset_id={asset_id[:30]}... price={price}")
+                        
+                        self.price_callback(asset_id, price)
+                    except Exception as e:
+                        print(f"[CLOB] Callback error: {e}")
         
         # Log occasionally
         if self.messages_received % 500 == 0:
