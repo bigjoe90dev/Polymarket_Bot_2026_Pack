@@ -46,6 +46,14 @@ class TradingBot:
         self._copy_trades = 0    # Copy trades executed
         self._copy_exits = 0     # Copy exits executed
         self._last_daily_summary = 0  # Daily TG summary timer
+        
+        # H.4A: Prewarm state - for next-market tracking during final 10 minutes
+        self._prewarm_enabled = True  # Set False to disable prewarm
+        self._prewarm_market = None  # Next upcoming market dict
+        self._prewarm_yes_token = None
+        self._prewarm_no_token = None
+        self._prewarm_start_minutes = None  # Minutes until prewarm market starts
+        self._prewarm_discovered = False  # Track if we've discovered prewarm
 
         # Configurable speed params
         self._markets_per_cycle = config.get("MARKETS_PER_CYCLE", DEFAULT_MARKETS_PER_CYCLE)
@@ -149,6 +157,132 @@ class TradingBot:
             target=self._watchdog, daemon=True
         )
         self._heartbeat_thread.start()
+        
+        # H.3: Initialize storyboard tracking
+        self._storyboard_last_log = 0
+        self._storyboard_interval = 30  # Log every 30 seconds
+    
+    # H.3: Paper trade storyboard logging
+    def _log_trade_storyboard(self, first_market, markets, now):
+        """Log comprehensive trade storyboard for selected market."""
+        if not self.is_btc_1h_only:
+            return
+            
+        # Throttle
+        if now - self._storyboard_last_log < self._storyboard_interval:
+            return
+        self._storyboard_last_log = now
+        
+        if not first_market:
+            return
+            
+        # Get market info
+        title = first_market.get('title', 'N/A')[:40]
+        yes_token = first_market.get('yes_token_id', '')[:12]
+        no_token = first_market.get('no_token_id', '')[:12]
+        in_window = first_market.get('in_window', False)
+        accepting = first_market.get('accepting_orders', False)
+        minutes_left = first_market.get('minutes_left')
+        
+        # Get WS prices if available
+        ws_yes = ""
+        ws_no = ""
+        if self.clob_websocket:
+            ws_yes = getattr(self.clob_websocket, '_yes_token_id', '')[:12]
+            ws_no = getattr(self.clob_websocket, '_no_token_id', '')[:12]
+        
+        # Get strategy state
+        ms = self.momentum_strategy
+        last_signal = "NONE"
+        no_trade_reason = "N/A"
+        can_enter = False
+        blocked_by = []
+        
+        if ms:
+            # Check position state
+            if hasattr(ms.tracker, 'positions') and ms.tracker.positions:
+                blocked_by.append("position_exists")
+            
+            # Check cooldown
+            if hasattr(ms.tracker, 'cooldowns'):
+                for token in [first_market.get('yes_token_id'), first_market.get('no_token_id')]:
+                    if token in ms.tracker.cooldowns:
+                        last_cooldown = ms.tracker.cooldowns.get(token, 0)
+                        if now - last_cooldown < ms.tracker.cooldown_minutes * 60:
+                            blocked_by.append("cooldown_active")
+            
+            # Get trendiness if available
+            trend_yes = trend_no = 0.0
+            if hasattr(ms.tracker, 'price_buffers'):
+                yes_token_full = first_market.get('yes_token_id')
+                no_token_full = first_market.get('no_token_id')
+                if yes_token_full:
+                    try:
+                        trend_yes = ms.tracker.compute_trendiness(yes_token_full)
+                    except:
+                        pass
+                if no_token_full:
+                    try:
+                        trend_no = ms.tracker.compute_trendiness(no_token_full)
+                    except:
+                        pass
+            
+            # Determine can_enter
+            if in_window and accepting and minutes_left and minutes_left > 5:
+                if not blocked_by:
+                    # Check if trend is sufficient
+                    if trend_yes >= ms.tracker.trendiness_threshold or trend_no >= ms.tracker.trendiness_threshold:
+                        can_enter = True
+                    else:
+                        no_trade_reason = "trend_below_threshold"
+                        blocked_by.append("trend_below_threshold")
+                else:
+                    no_trade_reason = ",".join(blocked_by)
+            else:
+                if not in_window:
+                    no_trade_reason = "not_in_window"
+                    blocked_by.append("not_in_window")
+                elif not accepting:
+                    no_trade_reason = "not_accepting_orders"
+                    blocked_by.append("not_accepting_orders")
+                elif minutes_left and minutes_left <= 5:
+                    no_trade_reason = "too_close_to_expiry"
+                    blocked_by.append("too_close_to_expiry")
+        
+        # Get paper engine state
+        paper_status = "N/A"
+        open_positions = 0
+        if self.execution and self.execution.paper_engine:
+            paper_status = self.execution.paper_engine.get_portfolio_summary()
+            open_positions = paper_status.get('open_positions', 0)
+        
+        # H.4C: Enhanced storyboard with prewarm and proof mode
+        # Get prewarm info
+        prewarm_title = ""
+        prewarm_active = False
+        prewarm_hist = "N/A"
+        if self._prewarm_discovered and self._prewarm_market:
+            prewarm_title = self._prewarm_market.get('title', '')[:30]
+            prewarm_active = True
+            prewarm_hist = f"{self._prewarm_start_minutes:.1f}min_to_start"
+        
+        # Get selected market history span
+        selected_hist = "N/A"
+        if ms and hasattr(ms.tracker, 'price_buffers'):
+            yes_full = first_market.get('yes_token_id')
+            if yes_full and yes_full in ms.tracker.price_buffers:
+                buf = ms.tracker.price_buffers[yes_full]
+                if buf and len(buf) > 0:
+                    selected_hist = f"{now - buf[0].timestamp:.1f}s"
+        
+        # Check proof mode
+        proof_mode_enabled = self.config.get("DEBUG_PROOF_TRADE_MODE", False)
+        
+        print(f"[TRADE STORYBOARD] "
+              f"selected={title[:25]}... prewarm={prewarm_title}... prewarm_active={prewarm_active} "
+              f"tradable_now={can_enter} blocked_by={blocked_by} "
+              f"selected_hist={selected_hist} prewarm_hist={prewarm_hist} "
+              f"proof_mode={proof_mode_enabled} open_pos={open_positions}")
 
     # F3d: Deterministic market selection helper (placed after __init__)
     def _select_btc_1h_market(self, markets):
@@ -525,6 +659,36 @@ class TradingBot:
                     self._last_audit_entry_allowed = entry_allowed
                     self._last_audit_is_live = in_window
                 
+                # H.4A: PREWARM NEXT MARKET - discover during final 10 minutes
+                if self._prewarm_enabled and first_market and minutes_left is not None:
+                    prewarm_trigger_minutes = 10  # Start prewarm when <= 10 min left
+                    
+                    if minutes_left <= prewarm_trigger_minutes and not self._prewarm_discovered:
+                        # Find next upcoming market (the one after current)
+                        # Look for markets with minutes_to_start > 0 (upcoming)
+                        next_candidates = [
+                            m for m in markets 
+                            if m.get('minutes_to_start', 0) > 0 
+                            and m.get('minutes_to_start', 999) > minutes_left
+                        ]
+                        if next_candidates:
+                            # Sort by minutes_to_start
+                            next_candidates.sort(key=lambda x: x.get('minutes_to_start', 999))
+                            self._prewarm_market = next_candidates[0]
+                            self._prewarm_yes_token = self._prewarm_market.get('yes_token_id', '')
+                            self._prewarm_no_token = self._prewarm_market.get('no_token_id', '')
+                            self._prewarm_start_minutes = self._prewarm_market.get('minutes_to_start', 0)
+                            self._prewarm_discovered = True
+                            print(f"[PREWARM] found_next_market title={self._prewarm_market.get('title', '')[:40]}... "
+                                  f"yes={self._prewarm_yes_token[:12]}... no={self._prewarm_no_token[:12]}... "
+                                  f"minutes_to_start={self._prewarm_start_minutes}")
+                    
+                    # Log prewarm state if active
+                    if self._prewarm_discovered and self._prewarm_market:
+                        prewarm_title = self._prewarm_market.get('title', '')[:30]
+                        print(f"[PREWARM] buffering_next_market title={prewarm_title}... "
+                              f"minutes_to_start={self._prewarm_start_minutes}")
+                
                 # ── ROLLOVER DETECTION: Check if market changed or expired ──
                 # F3: Also check token pair change (not just condition_id)
                 token_pair_changed = (current_yes_token != self._last_yes_token) or (current_no_token != self._last_no_token)
@@ -548,6 +712,47 @@ class TradingBot:
                     print(f"  old_yes={old_yes}... old_no={old_no}...")
                     print(f"  new_yes={new_yes}... new_no={new_no}...")
                     
+                    # H.4A: Check if prewarm market should be promoted
+                    if self._prewarm_discovered and self._prewarm_market:
+                        prewarm_title = self._prewarm_market.get('title', '')[:30]
+                        prewarm_yes = (self._prewarm_yes_token or '')[:12]
+                        prewarm_no = (self._prewarm_no_token or '')[:12]
+                        
+                        # Get prewarm history spans before promotion
+                        prewarm_hist_yes = 0
+                        prewarm_hist_no = 0
+                        if hasattr(self, 'momentum_strategy') and self.momentum_strategy:
+                            ms = self.momentum_strategy
+                            if hasattr(ms.tracker, 'price_buffers'):
+                                pb = ms.tracker.price_buffers
+                                if self._prewarm_yes_token and self._prewarm_yes_token in pb:
+                                    buf = pb[self._prewarm_yes_token]
+                                    if buf:
+                                        prewarm_hist_yes = time.time() - buf[0].timestamp if buf else 0
+                                if self._prewarm_no_token and self._prewarm_no_token in pb:
+                                    buf = pb[self._prewarm_no_token]
+                                    if buf:
+                                            prewarm_hist_no = time.time() - buf[0].timestamp if buf else 0
+                        
+                        # Check if new market matches prewarm (promotion)
+                        if current_yes_token == self._prewarm_yes_token:
+                            print(f"[ROLLOVER PROMOTE] old_title={old_title} new_title={prewarm_title}")
+                            print(f"  carried_history_yes={prewarm_hist_yes:.1f}s carried_history_no={prewarm_hist_no:.1f}s")
+                            # Clear prewarm state after promotion
+                            self._prewarm_market = None
+                            self._prewarm_yes_token = None
+                            self._prewarm_no_token = None
+                            self._prewarm_start_minutes = None
+                            self._prewarm_discovered = False
+                        else:
+                            # No match - clear prewarm (market changed unexpectedly)
+                            print(f"[PREWARM] cleared_no_match old={prewarm_title} new={new_title[:30]}")
+                            self._prewarm_market = None
+                            self._prewarm_yes_token = None
+                            self._prewarm_no_token = None
+                            self._prewarm_start_minutes = None
+                            self._prewarm_discovered = False
+                    
                     # Update tracking
                     self._current_condition_id = current_condition_id
                     self._current_yes_token = current_yes_token
@@ -556,6 +761,17 @@ class TradingBot:
                     self._last_no_token = current_no_token
                     # Track last market title for logging
                     self._last_market_title = first_market.get('title', current_condition_id)
+                    
+                    # H.2: Set selected market in strategy for correlation logging
+                    if hasattr(self, 'momentum_strategy') and self.momentum_strategy:
+                        self.momentum_strategy.set_selected_market(
+                            title=first_market.get('title', current_condition_id),
+                            yes_token_id=current_yes_token,
+                            no_token_id=current_no_token,
+                            in_window=in_window,
+                            accepting_orders=first_market.get('accepting_orders', False),
+                            minutes_left=minutes_left
+                        )
                     
                     # F3: Clear old strategy buffers before re-registering
                     if hasattr(self, 'momentum_strategy') and token_pair_changed:
@@ -737,6 +953,9 @@ class TradingBot:
                     if now - getattr(self, '_last_decision_tick_log', 0) >= 30:
                         print(f"[DECISION TICK] market={first_market.get('title', '')[:40]}... in_window={in_window} entry_allowed={entry_allowed}")
                         self._last_decision_tick_log = now
+                    
+                    # H.3: Paper trade storyboard - log comprehensive state
+                    self._log_trade_storyboard(first_market, markets, now)
 
             # F1 & F5: DECISION trace - deterministic chain when evaluating momentum strategy
             # Also add explicit skip reasons

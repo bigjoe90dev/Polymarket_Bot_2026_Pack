@@ -423,6 +423,42 @@ class TrendStrategy:
         self.trades_executed = 0
         self.decisions_log: List[TradeDecision] = []
         
+        # H.1: Signal diagnostics - rolling counters for understanding why no signals
+        self._diag_evaluated_count = 0
+        self._diag_none_count = 0
+        self._diag_long_count = 0
+        self._diag_short_count = 0
+        self._diag_hold_count = 0
+        self._diag_blocked_not_in_window = 0  # H.2: separate counter for not_in_window
+        self._diag_blocked_history = 0
+        self._diag_blocked_trend = 0
+        self._diag_blocked_breakout = 0
+        self._diag_blocked_time_left = 0
+        self._diag_blocked_sanity = 0
+        self._diag_blocked_momentum = 0
+        self._diag_blocked_spread = 0
+        self._diag_blocked_cooldown = 0
+        self._diag_blocked_position = 0
+        self._diag_blocked_other = 0
+        self._diag_last_summary_time = 0
+        self._diag_summary_interval = 60  # Print summary every 60 seconds
+        
+        # H.2: Track selected market for correlation logging
+        self._diag_selected_title = None
+        self._diag_selected_yes_token = None
+        self._diag_selected_no_token = None
+        
+        # H.1b: Optional JSONL audit file
+        self._diag_audit_file = None
+        if self.config.get("SIGNAL_AUDIT_ENABLED", False):
+            import os
+            audit_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "signal_audit.jsonl")
+            try:
+                self._diag_audit_file = open(audit_path, "a")
+                print(f"[*] Signal audit enabled: {audit_path}")
+            except Exception as e:
+                print(f"[!] Could not open signal audit file: {e}")
+        
         # Lock for thread safety
         self._lock = threading.Lock()
     
@@ -507,6 +543,15 @@ class TrendStrategy:
             self.tracker.update_price(no_token_id, no_price, "init")
         
         return True
+    
+    # H.2: Set selected market for correlation logging between bot and strategy
+    def set_selected_market(self, title: str, yes_token_id: str, no_token_id: str, 
+                           in_window: bool = False, accepting_orders: bool = False, 
+                           minutes_left: float = None):
+        """Called by bot to set the canonical selected market for correlation logging."""
+        self._diag_selected_title = title
+        self._diag_selected_yes_token = yes_token_id
+        self._diag_selected_no_token = no_token_id
     
     def on_price_update(self, token_id: str, price: float, source: str = "ws"):
         """Handle incoming price update (from WebSocket).
@@ -644,6 +689,7 @@ class TrendStrategy:
             # BTC_1H_ONLY: Check market window status first
             # Only evaluate when in_window=true AND accepting_orders=true AND minutes_left>=ENTRY_CUTOFF
             is_in_window = False
+            skip_reason = None
             if self.is_btc_1h_only and market_status:
                 in_window = market_status.get('in_window', False)
                 accepting_orders = market_status.get('accepting_orders', False)
@@ -651,16 +697,99 @@ class TrendStrategy:
                 entry_cutoff = self.config.get('TREND_TIME_LEFT_THRESHOLD', 5)  # Default 5 min
                 is_in_window = in_window and accepting_orders
                 
+                # H.2: Add SIGNAL CONTEXT correlation logging
+                selected_title = getattr(self, '_diag_selected_title', None) or "N/A"
+                selected_yes = getattr(self, '_diag_selected_yes_token', None) or ""
+                selected_no = getattr(self, '_diag_selected_no_token', None) or ""
+                strategy_title = market.get("market_name", "")
+                strategy_token = token_id
+                # Throttle context log to avoid spam
+                now = time_module.time()
+                if now - getattr(self, '_diag_last_context_log', 0) >= 30:
+                    self._diag_last_context_log = now
+                    print(f"[SIGNAL CONTEXT] selected_title={selected_title[:30]} selected_yes={selected_yes[:12]}... selected_no={selected_no[:12]}... "
+                          f"strategy_title={strategy_title[:30]} strategy_token={strategy_token[:12]}... "
+                          f"market_status_in_window={in_window} market_status_accepting={accepting_orders} market_status_mins_left={minutes_left}")
+                
+                # H.1/H.2: Track why we're skipping (for diagnostics)
                 if not in_window:
-                    # Market not in trading window - skip silently (reduce log spam)
-                    return
+                    skip_reason = "not_in_window"
+                    self._diag_blocked_not_in_window += 1  # H.2: fixed counter
+                elif not accepting_orders:
+                    skip_reason = "not_accepting_orders"
+                    self._diag_blocked_position += 1
+                elif minutes_left is not None and minutes_left < entry_cutoff:
+                    skip_reason = f"too_close_to_expiry({minutes_left:.1f}min<{entry_cutoff}min)"
+                    self._diag_blocked_history += 1
                 
-                if not accepting_orders:
-                    # Market not accepting orders - skip silently
-                    return
+                # H.1: Log SIGNAL CHECK with skip reason
+                market_title = market.get("market_name", "")
+                token_short = token_id[:12] + "..." if len(token_id) > 12 else token_id
+                now = time_module.time()
                 
-                if minutes_left is not None and minutes_left < entry_cutoff:
-                    # Too close to expiry - skip
+                # Get safe values for logging
+                try:
+                    hist_points = len(self.tracker.price_buffers.get(token_id, []))
+                except Exception:
+                    hist_points = 0
+                hist_span = 0
+                if hist_points > 0:
+                    try:
+                        buffer = list(self.tracker.price_buffers.get(token_id, []))
+                        if buffer:
+                            hist_span = now - buffer[0].timestamp
+                    except Exception:
+                        pass
+                
+                print(f"[SIGNAL CHECK] market={market_title[:25]}... token={token_short} "
+                      f"in_window={is_in_window} history={hist_points}points/{hist_span:.0f}s "
+                      f"decision=NONE reason={skip_reason}")
+                
+                # Increment counters
+                self._diag_evaluated_count += 1
+                self._diag_none_count += 1
+                
+                # Print summary periodically
+                if now - getattr(self, '_diag_last_summary_time', 0) >= self._diag_summary_interval:
+                    self._diag_last_summary_time = now
+                    print(f"[SIGNAL SUMMARY] evaluated={self._diag_evaluated_count} "
+                          f"none={self._diag_none_count} long={self._diag_long_count} short={self._diag_short_count} "
+                          f"blocked_not_in_window={self._diag_blocked_not_in_window} "
+                          f"blocked_history={self._diag_blocked_history} blocked_trend={self._diag_blocked_trend} "
+                          f"blocked_breakout={self._diag_blocked_breakout} blocked_time_left={self._diag_blocked_time_left} "
+                          f"blocked_sanity={self._diag_blocked_sanity} blocked_cooldown={self._diag_blocked_cooldown}")
+                
+                # H.4B: PROOF TRADE MODE - loosen entry for paper-only proof
+                proof_mode = self.config.get("DEBUG_PROOF_TRADE_MODE", False)
+                if proof_mode and self.paper_engine:
+                    # Check if we have enough history (at least some data)
+                    buffer = self.tracker.price_buffers.get(token_id, [])
+                    if buffer and len(buffer) >= 3:
+                        # Check for proof triggers
+                        proof_trigger = None
+                        current_price_check, _ = self.tracker.last_prices.get(token_id, (None, None))
+                        
+                        # Trigger 1: Large price move in short window (simulated large print)
+                        lookback = self.config.get("DEBUG_LOOKBACK_SECONDS", 60)
+                        short_move_threshold = self.config.get("DEBUG_SHORT_MOVE_THRESHOLD_PCT", 0.02)  # 2%
+                        recent = [p for p in buffer if now - p.timestamp <= lookback]
+                        if len(recent) >= 2:
+                            price_start = recent[0].price
+                            price_end = recent[-1].price
+                            if price_start > 0:
+                                move_pct = abs(price_end - price_start) / price_start
+                                if move_pct >= short_move_threshold:
+                                    proof_trigger = f"short_move"
+                        
+                        # If proof trigger found, allow entry despite normal gates
+                        if proof_trigger:
+                            print(f"[DEBUG ENTRY] trigger={proof_trigger} proof_mode=True - bypassing normal gates")
+                            # Clear skip_reason to allow processing
+                            skip_reason = None
+                            is_in_window = True  # Force in_window for proof
+                
+                # Return early - market not ready for trading (unless proof mode bypassed)
+                if skip_reason and not (proof_mode and self.paper_engine and skip_reason in ["not_in_window", "not_accepting_orders"]):
                     return
             
             # Get current price for SIGNAL log
@@ -686,13 +815,28 @@ class TrendStrategy:
                 end_date = self.market_metadata[condition_id].get("end_date")
             time_left, time_source = self.tracker.parse_time_left(market_title, end_date)
             
-            # Throttled SIGNAL log for in-window market (every 10 seconds)
+            # H.1b: Get history info for diagnostics
+            import time as time_module
             now = time_module.time()
+            try:
+                hist_points = len(self.tracker.price_buffers.get(token_id, []))
+            except Exception:
+                hist_points = 0
+            hist_span = 0
+            if hist_points > 0:
+                try:
+                    buffer = list(self.tracker.price_buffers.get(token_id, []))
+                    if buffer:
+                        hist_span = now - buffer[0].timestamp
+                except Exception:
+                    pass
+            
+            # Throttled SIGNAL CHECK for in-window market (every 10 seconds)
             last_signal_log = getattr(self, '_last_signal_log_time', 0)
             if is_in_window and (now - last_signal_log) >= 10:
                 self._last_signal_log_time = now
                 
-                # Determine decision and reason
+                # Determine decision and reason with counter increments
                 decision = "HOLD"
                 reason = "unknown"
                 
@@ -700,39 +844,118 @@ class TrendStrategy:
                 is_sane, sanity_reason = self.tracker.is_data_sane(token_id)
                 if not is_sane:
                     decision = "HOLD"
-                    reason = f"Layer0:{sanity_reason}"
+                    reason = f"sanity_failed:{sanity_reason}"
+                    self._diag_blocked_sanity += 1
                 elif trendiness < self.tracker.trendiness_threshold:
                     decision = "HOLD"
-                    reason = f"Layer1:trend={trendiness:.2f}<{self.tracker.trendiness_threshold}"
+                    reason = f"trend_below_thresh({trendiness:.2f}<{self.tracker.trendiness_threshold})"
+                    self._diag_blocked_trend += 1
                 elif rolling_high is None:
                     decision = "HOLD"
                     reason = "no_rolling_data"
+                    self._diag_blocked_history += 1
                 elif outcome == "YES" and current_price and rolling_high and current_price > rolling_high:
                     ticks_above = (current_price - rolling_high) * 100
                     if ticks_above >= self.tracker.breakout_ticks:
                         decision = "ENTER_LONG"
-                        reason = f"breakout_yes"
+                        reason = f"breakout_yes({ticks_above:.1f}ticks)"
+                        self._diag_long_count += 1
+                    else:
+                        decision = "HOLD"
+                        reason = f"breakout_weak({ticks_above:.1f}ticks<{self.tracker.breakout_ticks})"
+                        self._diag_blocked_breakout += 1
                 elif outcome == "NO" and current_price and rolling_low and current_price < rolling_low:
                     ticks_below = (rolling_low - current_price) * 100
                     if ticks_below >= self.tracker.breakout_ticks:
                         decision = "ENTER_SHORT"
-                        reason = f"breakout_no"
+                        reason = f"breakout_no({ticks_below:.1f}ticks)"
+                        self._diag_short_count += 1
+                    else:
+                        decision = "HOLD"
+                        reason = f"breakout_weak({ticks_below:.1f}ticks<{self.tracker.breakout_ticks})"
+                        self._diag_blocked_breakout += 1
                 else:
                     # Check time left gate
                     if time_left is not None and time_left < self.tracker.time_left_threshold:
-                        reason = f"time_left:{time_left:.1f}min"
+                        decision = "HOLD"
+                        reason = f"time_left_gate({time_left:.1f}min<{self.tracker.time_left_threshold}min)"
+                        self._diag_blocked_time_left += 1
                     else:
-                        reason = f"no_breakout"
+                        decision = "HOLD"
+                        reason = "no_breakout_signal"
+                        self._diag_blocked_breakout += 1
                 
-                # Format the log (safe float conversion to avoid invalid format specifier crash)
+                # H.1b: Count holds
+                if decision == "HOLD":
+                    self._diag_hold_count += 1
+                
+                # Increment evaluated count
+                self._diag_evaluated_count += 1
+                
+                # Safe float conversions
                 token_short = token_id[:12] + "..." if len(token_id) > 12 else token_id
                 try:
                     mid = float(current_price) if current_price is not None else 0.0
                 except Exception:
                     mid = 0.0
-                print(f"[SIGNAL] market={market_title[:30]}... token={token_short} mid={mid:.4f} "
-                      f"lookback=600s move={return_5min*100:.2f}% trend={trendiness:.2f} spread={spread_pct} liquidity={liquidity} "
+                try:
+                    rh_str = f"{rolling_high:.4f}" if rolling_high is not None else "N/A"
+                except Exception:
+                    rh_str = "N/A"
+                try:
+                    rl_str = f"{rolling_low:.4f}" if rolling_low is not None else "N/A"
+                except Exception:
+                    rl_str = "N/A"
+                try:
+                    tl_str = f"{time_left:.1f}" if time_left is not None else "N/A"
+                except Exception:
+                    tl_str = "N/A"
+                try:
+                    ret5_str = f"{return_5min*100:.2f}" if return_5min is not None else "0.00"
+                except Exception:
+                    ret5_str = "0.00"
+                
+                # H.1b: Detailed SIGNAL CHECK log
+                print(f"[SIGNAL CHECK] market={market_title[:25]}... token={token_short} outcome={outcome} "
+                      f"in_window={is_in_window} mid={mid:.4f} history={hist_points}pts/{hist_span:.0f}s "
+                      f"trend={trendiness:.2f} ret5m={ret5_str}% rh={rh_str} rl={rl_str} time_left={tl_str}min "
                       f"decision={decision} reason={reason}")
+                
+                # H.1b: JSONL audit
+                if self._diag_audit_file:
+                    import json
+                    audit_rec = {
+                        "ts": now,
+                        "market": market_title[:50],
+                        "token": token_id,
+                        "outcome": outcome,
+                        "in_window": is_in_window,
+                        "current_price": mid,
+                        "history_points": hist_points,
+                        "history_span": hist_span,
+                        "trendiness": trendiness,
+                        "return_5min": return_5min,
+                        "rolling_high": rolling_high,
+                        "rolling_low": rolling_low,
+                        "time_left": time_left,
+                        "decision": decision,
+                        "signal_reason": reason
+                    }
+                    try:
+                        self._diag_audit_file.write(json.dumps(audit_rec) + "\n")
+                        self._diag_audit_file.flush()
+                    except Exception:
+                        pass
+                
+                # H.1b: Print summary periodically
+                if now - getattr(self, '_diag_last_summary_time', 0) >= self._diag_summary_interval:
+                    self._diag_last_summary_time = now
+                    print(f"[SIGNAL SUMMARY] evaluated={self._diag_evaluated_count} long={self._diag_long_count} "
+                          f"short={self._diag_short_count} hold={self._diag_hold_count} "
+                          f"blocked_not_in_window={self._diag_blocked_not_in_window} "
+                          f"blocked_history={self._diag_blocked_history} blocked_trend={self._diag_blocked_trend} "
+                          f"blocked_breakout={self._diag_blocked_breakout} blocked_time_left={self._diag_blocked_time_left} "
+                          f"blocked_sanity={self._diag_blocked_sanity} blocked_cooldown={self._diag_blocked_cooldown}")
             
             # Layer 0: Data sanity check
             is_sane, sanity_reason = self.tracker.is_data_sane(token_id)
@@ -955,8 +1178,13 @@ class TrendStrategy:
                 # RISK: Entry cutoff check - verify we can still enter
                 entry_allowed, mins_left, cutoff = self.is_entry_allowed(condition_id)
                 if not entry_allowed:
-                    print(f"[RISK] BLOCKED entry_allowed=False minutes_left={mins_left:.0f} cutoff={cutoff}")
-                    return None  # Skip this signal
+                    # H.3: Debug trigger - force trade for proof-of-concept (PAPER ONLY)
+                    debug_force = self.config.get("DEBUG_FORCE_TRADE_ON_LARGE_PRINT", False)
+                    if debug_force and self.paper_engine:
+                        print(f"[DEBUG] Forcing trade despite entry_allowed=False (DEBUG_FORCE_TRADE_ON_LARGE_PRINT=True)")
+                    else:
+                        print(f"[RISK] BLOCKED entry_allowed=False minutes_left={mins_left:.0f} cutoff={cutoff}")
+                        return None  # Skip this signal
                 print(f"[RISK] OK entry_allowed=True minutes_left={mins_left:.0f} cutoff={cutoff}")
                 
                 # EXEC: Submit to paper engine
